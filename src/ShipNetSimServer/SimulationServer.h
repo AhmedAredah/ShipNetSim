@@ -230,14 +230,6 @@ private slots:
      * @param shipID The ID of the ship to which containers are added.
      */
     void onContainersAddedToShip(QString networkName, QString shipID);
-    void onShipReachedSeaPort(QString networkName, QString shipID,
-                              QString seaPortCode, qsizetype containersCount);
-    void onPortsAvailable(QMap<QString,
-                               QVector<QString>> networkPorts);
-    void onContainersUnloaded(QString networkName,
-                              QString shipID,
-                              QString seaPortName,
-                              QJsonArray containers);
 
     /**
      * @brief Emitted when an error occurs.
