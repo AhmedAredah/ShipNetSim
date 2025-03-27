@@ -92,9 +92,14 @@ SimulationServer::~SimulationServer() {
 }
 
 void SimulationServer::startRabbitMQServer(const std::string &hostname,
-                                           int port) {
+                                           const int port,
+                                           const std::string &rabbitMQUsername,
+                                           const std::string &rabbitMQPassword)
+{
     mHostname = hostname;
     mPort = port;
+    mRabbitMQUsername = rabbitMQUsername;
+    mRabbitMQPassword = rabbitMQPassword;
     reconnectToRabbitMQ();
 }
 
@@ -145,7 +150,8 @@ void SimulationServer::reconnectToRabbitMQ() {
 
         amqp_rpc_reply_t loginRes =
             amqp_login(mRabbitMQConnection, "/", 0, 131072, 0,
-                       AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+                       AMQP_SASL_METHOD_PLAIN, mRabbitMQUsername.c_str(),
+                       mRabbitMQPassword.c_str());
         if (loginRes.reply_type != AMQP_RESPONSE_NORMAL) {
             qCritical() << "Error: RabbitMQ login failed. Retrying...";
             retryCount++;
