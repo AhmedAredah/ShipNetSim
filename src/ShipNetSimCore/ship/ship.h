@@ -20,6 +20,7 @@
 #include "../../third_party/units/units.h"
 #include "battery.h"
 #include "ishippropeller.h"
+#include "qmutex.h"
 #include "tank.h"
 #include <QObject>
 #include <QMap>

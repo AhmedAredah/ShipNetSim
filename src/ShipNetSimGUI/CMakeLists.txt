@@ -2,7 +2,9 @@ set(SHIPNETSIM_GUI_NAME "ShipNetSimGUI" CACHE STRING "Project GUI name" FORCE)
 project(${SHIPNETSIM_NAME} VERSION ${ShipNetSim_VERSION} LANGUAGES CXX)
 find_package(QT NAMES Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets Concurrent Sql PrintSupport)
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets Concurrent Sql PrintSupport)
-find_package(Fontconfig REQUIRED)
+if(UNIX AND NOT APPLE)  # True for Linux only
+    find_package(Fontconfig REQUIRED)
+endif()
 
 # Find OpenGL 
 find_package(OpenGL REQUIRED)
@@ -151,9 +153,15 @@ target_link_libraries(${SHIPNETSIM_GUI_NAME} PRIVATE
     # osg3::osgText
     osg3::osgShadow
     osg3::OpenThreads
-    Fontconfig::Fontconfig
+    # Fontconfig::Fontconfig
     KDReports::kdreports
 )
+
+if(UNIX AND NOT APPLE)  # True for Linux only
+    target_link_libraries(${SHIPNETSIM_GUI_NAME} PRIVATE
+        Fontconfig::Fontconfig
+    )
+endif()
 
 # Apply additional linker flags, if necessary
 if(osgEarth_LDFLAGS)
