@@ -2,6 +2,7 @@
 #define HIERARCHICALVISIBILITYGRAPH_H
 
 #include "gline.h"
+#include "gsegment.h"
 #include "polygon.h"
 #include "quadtree.h"
 #include "seaport.h"
@@ -156,6 +157,13 @@ private:
     void buildAllLevels();
     void buildLevel(int idx);
     void buildAdjacencyForLevel(int idx);
+
+    /** @brief Core visibility implementation using GSegment for hot-path geometry. */
+    bool isSegmentVisibleImpl(
+        const GSegment& seg,
+        const std::shared_ptr<GPoint>& startPt,
+        const std::shared_ptr<GPoint>& endPt,
+        int level) const;
 
     std::shared_ptr<GPoint> snapToWater(
         const std::shared_ptr<GPoint>& point, int level) const;

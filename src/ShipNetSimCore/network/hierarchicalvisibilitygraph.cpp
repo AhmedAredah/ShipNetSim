@@ -947,24 +947,13 @@ bool HierarchicalVisibilityGraph::isVisible(
     if (*node1 == *node2)
         return true;
 
-    // Fast haversine distance check to skip short segments without
-    // constructing a GLine (avoids 2 geodesic Inverse calls + heap alloc).
-    double lat1 = node1->getLatitude().value() * M_PI / 180.0;
-    double lat2 = node2->getLatitude().value() * M_PI / 180.0;
-    double dLat = lat2 - lat1;
-    double dLon = (node2->getLongitude().value() -
-                   node1->getLongitude().value()) * M_PI / 180.0;
-    double a = std::sin(dLat / 2.0) * std::sin(dLat / 2.0) +
-               std::cos(lat1) * std::cos(lat2) *
-               std::sin(dLon / 2.0) * std::sin(dLon / 2.0);
-    double approxDistMeters = 6371000.0 * 2.0 * std::asin(std::sqrt(a));
+    // Use GSegment for fast haversine — no geodesic Inverse, no OGR
+    GSegment seg(node1, node2);
 
-    if (approxDistMeters < 1.0)
+    if (seg.approxLengthMeters() < 1.0)
         return true;
 
-    // Construct GLine on stack — avoids heap allocation + atomic refcount
-    GLine segment(node1, node2);
-    return isSegmentVisible(segment, level);
+    return isSegmentVisibleImpl(seg, node1, node2, level);
 }
 
 bool HierarchicalVisibilityGraph::isSegmentVisible(
@@ -981,10 +970,6 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
             return true;
     }
 
-    const auto& lvl = mLevels[level];
-    if (!lvl.quadtree)
-        return false;
-
     // Handle antimeridian crossing
     if (Quadtree::isSegmentCrossingAntimeridian(segment))
     {
@@ -998,23 +983,44 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
         return true;
     }
 
-    // Note: Read lock removed from hot path. Level data is immutable after
-    // buildAllLevels(). Write locks in clear()/setPolygons() protect against
-    // concurrent structural modifications which should not overlap with queries.
+    GSegment seg(segment);
+    return isSegmentVisibleImpl(seg, segment->startPoint(),
+                                segment->endPoint(), level);
+}
 
-    if (segment->length() < units::length::meter_t(1.0))
+bool HierarchicalVisibilityGraph::isSegmentVisible(
+    const GLine& segment,
+    int level) const
+{
+    GSegment seg(segment);
+    auto startPt = segment.startPoint();
+    auto endPt = segment.endPoint();
+    return isSegmentVisibleImpl(seg, startPt, endPt, level);
+}
+
+bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
+    const GSegment& seg,
+    const std::shared_ptr<GPoint>& startPt,
+    const std::shared_ptr<GPoint>& endPt,
+    int level) const
+{
+    const auto& lvl = mLevels[level];
+    if (!lvl.quadtree)
+        return false;
+
+    if (seg.approxLengthMeters() < 1.0)
         return true;
 
-    // Water polygon validation
+    // Water polygon validation — needs GLine for polygon API compatibility
     QVector<std::shared_ptr<Polygon>> startPolygons =
-        segment->startPoint()->getOwningPolygons();
+        startPt->getOwningPolygons();
     QVector<std::shared_ptr<Polygon>> endPolygons =
-        segment->endPoint()->getOwningPolygons();
+        endPt->getOwningPolygons();
 
     if (startPolygons.isEmpty())
-        startPolygons = findAllContainingPolygons(segment->startPoint());
+        startPolygons = findAllContainingPolygons(startPt);
     if (endPolygons.isEmpty())
-        endPolygons = findAllContainingPolygons(segment->endPoint());
+        endPolygons = findAllContainingPolygons(endPt);
 
     // Find common polygon
     std::shared_ptr<Polygon> commonPolygon = nullptr;
@@ -1033,30 +1039,32 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
 
     if (commonPolygon)
     {
-        if (!commonPolygon->isValidWaterSegment(segment))
+        // Build a fast GLine for polygon water-segment check
+        auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
+        if (!commonPolygon->isValidWaterSegment(segLine))
             return false;
     }
     else
     {
+        auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
         for (const auto& polygon : lvl.polygons)
         {
-            if (!polygon->segmentBoundsIntersect(segment))
+            if (!polygon->segmentBoundsIntersect(segLine))
                 continue;
-            if (polygon->segmentCrossesHoles(segment))
+            if (polygon->segmentCrossesHoles(segLine))
                 return false;
         }
     }
 
-    // Quadtree edge intersection check
+    // Quadtree edge intersection check — use GSegment throughout
+    auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
     auto intersectingNodes =
-        lvl.quadtree->findNodesIntersectingLineSegmentParallel(segment);
+        lvl.quadtree->findNodesIntersectingLineSegmentParallel(segLine);
 
-    auto segStart = segment->startPoint();
-    auto segEnd = segment->endPoint();
-    double startLon = segStart->getLongitude().value();
-    double endLon = segEnd->getLongitude().value();
-    double startLat = segStart->getLatitude().value();
-    double endLat = segEnd->getLatitude().value();
+    double startLon = seg.startLon();
+    double endLon = seg.endLon();
+    double startLat = seg.startLat();
+    double endLat = seg.endLat();
     double segMinLat = std::min(startLat, endLat);
     double segMaxLat = std::max(startLat, endLat);
 
@@ -1088,6 +1096,7 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
         segMaxLon = std::max(startLon, endLon);
     }
 
+    // Build query GSegment once for all intersection tests
     auto checkEdge = [&](const std::shared_ptr<GLine>& edge) {
         auto edgeStartPt = edge->startPoint();
         auto edgeEndPt = edge->endPoint();
@@ -1142,7 +1151,9 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
             pointOnEdgeFast(endLon, endLat))
             return false;
 
-        return segment->intersects(*edge, true);
+        // Use GSegment intersection instead of GLine::intersects
+        GSegment edgeSeg(eLon1, eLat1, eLon2, eLat2);
+        return seg.intersects(edgeSeg, false);
     };
 
     for (auto* node : intersectingNodes)
@@ -1155,18 +1166,6 @@ bool HierarchicalVisibilityGraph::isSegmentVisible(
     }
 
     return true;
-}
-
-bool HierarchicalVisibilityGraph::isSegmentVisible(
-    const GLine& segment,
-    int level) const
-{
-    // Wrap in shared_ptr for APIs that require it.
-    // The GLine is already constructed on the stack by the caller;
-    // the shared_ptr here has a no-op deleter to avoid double-free.
-    auto segPtr = std::shared_ptr<GLine>(
-        const_cast<GLine*>(&segment), [](GLine*){});
-    return isSegmentVisible(segPtr, level);
 }
 
 bool HierarchicalVisibilityGraph::isVisibleInSimplifiedPolygon(

@@ -1,5 +1,6 @@
 // quad.cpp
 #include "quadtree.h"
+#include "gsegment.h"
 #include <QtEndian>
 #include <algorithm>
 #include <limits>
@@ -1236,54 +1237,10 @@ void Quadtree::rangeQueryHelper(
 bool Quadtree::segmentIntersectsRange(
     const std::shared_ptr<GLine> &segment, const QRectF &range) const
 {
-
-    // Get coordinates in degrees
-    double startX = segment->startPoint()->getLongitude().value();
-    double startY = segment->startPoint()->getLatitude().value();
-    double endX   = segment->endPoint()->getLongitude().value();
-    double endY   = segment->endPoint()->getLatitude().value();
-
-    // Check if either endpoint is inside the range
-    if (range.contains(QPointF(startX, startY))
-        || range.contains(QPointF(endX, endY)))
-    {
-        return true;
-    }
-
-    // Create line segments for range edges in degrees
-    GLine topEdge(
-        std::make_shared<GPoint>(units::angle::degree_t(range.left()),
-                                 units::angle::degree_t(range.top())),
-        std::make_shared<GPoint>(
-            units::angle::degree_t(range.right()),
-            units::angle::degree_t(range.top())));
-
-    GLine bottomEdge(std::make_shared<GPoint>(
-                         units::angle::degree_t(range.left()),
-                         units::angle::degree_t(range.bottom())),
-                     std::make_shared<GPoint>(
-                         units::angle::degree_t(range.right()),
-                         units::angle::degree_t(range.bottom())));
-
-    GLine leftEdge(
-        std::make_shared<GPoint>(units::angle::degree_t(range.left()),
-                                 units::angle::degree_t(range.top())),
-        std::make_shared<GPoint>(
-            units::angle::degree_t(range.left()),
-            units::angle::degree_t(range.bottom())));
-
-    GLine rightEdge(std::make_shared<GPoint>(
-                        units::angle::degree_t(range.right()),
-                        units::angle::degree_t(range.top())),
-                    std::make_shared<GPoint>(
-                        units::angle::degree_t(range.right()),
-                        units::angle::degree_t(range.bottom())));
-
-    // Check if segment intersects any edge
-    return segment->intersects(topEdge)
-           || segment->intersects(bottomEdge)
-           || segment->intersects(leftEdge)
-           || segment->intersects(rightEdge);
+    // Use GSegment for fast AABB intersection — no GPoint/GLine construction
+    GSegment seg(segment);
+    return seg.intersectsAABB(range.left(), range.top(),
+                              range.right(), range.bottom());
 }
 
 QVector<std::shared_ptr<GPoint>>

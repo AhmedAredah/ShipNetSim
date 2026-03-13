@@ -29,6 +29,16 @@ namespace ShipNetSimCore
 {
 
 class GAlgebraicVector;  // Forward declaration
+class GSegment;          // Forward declaration
+
+/**
+ * @brief Tag type for GLine fast construction (no SR validation,
+ *        no OGR, no geodesic computation).
+ */
+struct FastConstructTag {};
+
+/// Global instance of the fast-construct tag.
+inline constexpr FastConstructTag FastConstruct{};
 
 /**
  * @class GLine
@@ -46,7 +56,9 @@ class SHIPNETSIM_EXPORT GLine : public BaseGeometry
 private:
     std::shared_ptr<GPoint> start;   ///< Start point of the line segment
     std::shared_ptr<GPoint> end;     ///< End point of the line segment
-    OGRLineString line;              ///< GDAL internal line representation
+
+    mutable bool mOGRLineInitialized = false;  ///< Lazy OGRLineString flag
+    mutable OGRLineString line;                ///< GDAL internal line (lazy)
 
     units::length::meter_t mLength;           ///< Geodesic length (meters)
     units::angle::degree_t mForwardAzimuth;   ///< Azimuth from start to end
@@ -55,6 +67,9 @@ private:
 
     /// Tolerance for point proximity comparisons (meters)
     static constexpr double TOLERANCE = 0.1;
+
+    /// Build OGRLineString on first access.
+    void ensureOGRLine() const;
 
     // =========================================================================
     // Constructors and Destructor
@@ -73,6 +88,18 @@ public:
      * @throws std::runtime_error if spatial references don't match
      */
     GLine(std::shared_ptr<GPoint> start, std::shared_ptr<GPoint> end);
+
+    /**
+     * @brief Fast constructor — skips SR validation, OGR build, geodesic
+     *        computation. Only stores start/end pointers. Derived values
+     *        (length, azimuth) are zero until explicitly computed.
+     *
+     * @param start Shared pointer to the start point
+     * @param end Shared pointer to the end point
+     * @param tag FastConstructTag to disambiguate
+     */
+    GLine(std::shared_ptr<GPoint> start, std::shared_ptr<GPoint> end,
+          FastConstructTag tag);
 
     /**
      * @brief Destructor.

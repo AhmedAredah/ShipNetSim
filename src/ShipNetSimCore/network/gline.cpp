@@ -14,6 +14,7 @@
  */
 
 #include "gline.h"
+#include "gsegment.h"
 #include "galgebraicvector.h"
 
 #include <GeographicLib/Geodesic.hpp>
@@ -288,7 +289,8 @@ void recalculateLineProperties(
 // =============================================================================
 
 GLine::GLine()
-    : mLength(units::length::meter_t(0.0))
+    : mOGRLineInitialized(false)
+    , mLength(units::length::meter_t(0.0))
     , mForwardAzimuth(units::angle::degree_t(0.0))
     , mBackwardAzimuth(units::angle::degree_t(0.0))
     , mWidth(units::length::meter_t(0.0))
@@ -300,17 +302,12 @@ GLine::GLine()
     end = std::make_shared<GPoint>(
         units::angle::degree_t(0.0),
         units::angle::degree_t(0.0));
-
-    // Initialize GDAL line
-    OGRPoint sp = start->getGDALPoint();
-    OGRPoint ep = end->getGDALPoint();
-    line.addPoint(&sp);
-    line.addPoint(&ep);
 }
 
 GLine::GLine(std::shared_ptr<GPoint> startPoint, std::shared_ptr<GPoint> endPoint)
     : start(startPoint)
     , end(endPoint)
+    , mOGRLineInitialized(false)
     , mWidth(units::length::meter_t(0.0))
 {
     // Validate spatial reference compatibility
@@ -321,14 +318,22 @@ GLine::GLine(std::shared_ptr<GPoint> startPoint, std::shared_ptr<GPoint> endPoin
             "Mismatch spatial reference for the two points!");
     }
 
-    // Initialize GDAL line
-    OGRPoint sp = start->getGDALPoint();
-    OGRPoint ep = end->getGDALPoint();
-    line.addPoint(&sp);
-    line.addPoint(&ep);
-
     // Calculate geodesic properties
     recalculateLineProperties(*start, *end, mLength, mForwardAzimuth, mBackwardAzimuth);
+}
+
+GLine::GLine(std::shared_ptr<GPoint> startPoint, std::shared_ptr<GPoint> endPoint,
+             FastConstructTag)
+    : start(std::move(startPoint))
+    , end(std::move(endPoint))
+    , mOGRLineInitialized(false)
+    , mLength(units::length::meter_t(0.0))
+    , mForwardAzimuth(units::angle::degree_t(0.0))
+    , mBackwardAzimuth(units::angle::degree_t(0.0))
+    , mWidth(units::length::meter_t(0.0))
+{
+    // No SR validation, no OGR build, no geodesic computation.
+    // Derived values remain zero until explicitly computed.
 }
 
 GLine::~GLine()
@@ -340,8 +345,22 @@ GLine::~GLine()
 // Accessors - Basic Properties
 // =============================================================================
 
+void GLine::ensureOGRLine() const
+{
+    if (!mOGRLineInitialized)
+    {
+        OGRPoint sp = start->getGDALPoint();
+        OGRPoint ep = end->getGDALPoint();
+        line.empty();
+        line.addPoint(&sp);
+        line.addPoint(&ep);
+        mOGRLineInitialized = true;
+    }
+}
+
 OGRLineString GLine::getGDALLine() const
 {
+    ensureOGRLine();
     return line;
 }
 
@@ -382,20 +401,14 @@ units::length::meter_t GLine::getTheoriticalWidth() const
 void GLine::setStartPoint(std::shared_ptr<GPoint> sPoint)
 {
     start = sPoint;
-
-    OGRPoint sp = start->getGDALPoint();
-    line.setPoint(0, &sp);
-
+    mOGRLineInitialized = false;
     recalculateLineProperties(*start, *end, mLength, mForwardAzimuth, mBackwardAzimuth);
 }
 
 void GLine::setEndPoint(std::shared_ptr<GPoint> ePoint)
 {
     end = ePoint;
-
-    OGRPoint ep = end->getGDALPoint();
-    line.setPoint(1, &ep);
-
+    mOGRLineInitialized = false;
     recalculateLineProperties(*start, *end, mLength, mForwardAzimuth, mBackwardAzimuth);
 }
 
@@ -516,23 +529,10 @@ GLine::getlocationToLine(const std::shared_ptr<GPoint> &point) const
 
 bool GLine::intersects(GLine &other, bool ignoreEdgePoints) const
 {
-    if (ignoreEdgePoints)
-    {
-        auto pointsAreClose = [this](const GPoint &p1, const GPoint &p2) -> bool {
-            return p1.distance(p2).value() <= TOLERANCE;
-        };
-
-        if (pointsAreClose(*start, *other.start) ||
-            pointsAreClose(*start, *other.end) ||
-            pointsAreClose(*end, *other.start) ||
-            pointsAreClose(*end, *other.end))
-        {
-            return false;
-        }
-    }
-
-    OGRLineString otherLine = other.getGDALLine();
-    return getGDALLine().Intersects(&otherLine);
+    // Delegate to GSegment for fast cross-product intersection
+    GSegment thisSeg(*this);
+    GSegment otherSeg(other);
+    return thisSeg.intersects(otherSeg, ignoreEdgePoints);
 }
 
 units::angle::radian_t GLine::smallestAngleWith(GLine &other) const

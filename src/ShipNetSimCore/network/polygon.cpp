@@ -15,6 +15,7 @@
  */
 
 #include "polygon.h"
+#include "gsegment.h"
 #include "../utils/gdal_compat.h"
 #include "../utils/utils.h"
 #include "qdebug.h"
@@ -805,33 +806,43 @@ bool Polygon::isSegmentCrossingHoleBoundary(
         return false;
     }
 
+    // Extract query segment coordinates once
+    GSegment querySeg(segment);
     int numPoints = hole->getNumPoints();
 
     for (int i = 0; i < numPoints - 1; ++i)
     {
-        auto holeEdgeStart = pointFromRing(hole, i);
-        auto holeEdgeEnd   = pointFromRing(hole, i + 1);
-        auto holeEdge = std::make_shared<GLine>(holeEdgeStart, holeEdgeEnd);
+        double eLon1 = hole->getX(i);
+        double eLat1 = hole->getY(i);
+        double eLon2 = hole->getX(i + 1);
+        double eLat2 = hole->getY(i + 1);
+        GSegment holeSeg(eLon1, eLat1, eLon2, eLat2);
 
-        if (segment->intersects(*holeEdge, false))
+        if (querySeg.intersects(holeSeg, false))
         {
-            bool startPointOnHoleEdge =
-                (*segment->startPoint() == *holeEdgeStart) ||
-                (*segment->startPoint() == *holeEdgeEnd);
-            bool endPointOnHoleEdge =
-                (*segment->endPoint() == *holeEdgeStart) ||
-                (*segment->endPoint() == *holeEdgeEnd);
+            // Coordinate-based endpoint check (no geodesic calls)
+            constexpr double COORD_TOL = 1e-9;
+            bool startOnEdge =
+                (std::abs(querySeg.startLon() - eLon1) < COORD_TOL &&
+                 std::abs(querySeg.startLat() - eLat1) < COORD_TOL) ||
+                (std::abs(querySeg.startLon() - eLon2) < COORD_TOL &&
+                 std::abs(querySeg.startLat() - eLat2) < COORD_TOL);
+            bool endOnEdge =
+                (std::abs(querySeg.endLon() - eLon1) < COORD_TOL &&
+                 std::abs(querySeg.endLat() - eLat1) < COORD_TOL) ||
+                (std::abs(querySeg.endLon() - eLon2) < COORD_TOL &&
+                 std::abs(querySeg.endLat() - eLat2) < COORD_TOL);
 
             // Both endpoints on same hole edge = valid edge traversal
-            if (startPointOnHoleEdge && endPointOnHoleEdge)
+            if (startOnEdge && endOnEdge)
             {
                 continue;
             }
 
             // One endpoint on hole edge - check if intersection is at vertex
-            if (startPointOnHoleEdge || endPointOnHoleEdge)
+            if (startOnEdge || endOnEdge)
             {
-                if (!isIntersectionAtVertex(segment, holeEdge))
+                if (!isIntersectionAtVertex(querySeg, holeSeg))
                 {
                     return true;
                 }
@@ -851,21 +862,32 @@ bool Polygon::isIntersectionAtVertex(
     const std::shared_ptr<GLine> &segment1,
     const std::shared_ptr<GLine> &segment2) const
 {
-    auto s1_start = segment1->startPoint();
-    auto s1_end   = segment1->endPoint();
-    auto s2_start = segment2->startPoint();
-    auto s2_end   = segment2->endPoint();
+    GSegment s1(segment1);
+    GSegment s2(segment2);
+    return isIntersectionAtVertex(s1, s2);
+}
 
-    // Check all four vertex combinations
-    if (s1_start->distance(*s2_start).value() < VERTEX_TOLERANCE_METERS ||
-        s1_start->distance(*s2_end).value() < VERTEX_TOLERANCE_METERS ||
-        s1_end->distance(*s2_start).value() < VERTEX_TOLERANCE_METERS ||
-        s1_end->distance(*s2_end).value() < VERTEX_TOLERANCE_METERS)
-    {
-        return true;
-    }
+bool Polygon::isIntersectionAtVertex(
+    const GSegment &seg1,
+    const GSegment &seg2) const
+{
+    // Coordinate-based vertex proximity check
+    // VERTEX_TOLERANCE_METERS ~= 0.1m ~= 0.000001 degrees at equator
+    constexpr double COORD_TOL = 0.000002;  // ~0.2m at equator
 
-    return false;
+    auto coordsNear = [](double lon1, double lat1,
+                         double lon2, double lat2, double tol) {
+        return std::abs(lon1 - lon2) < tol && std::abs(lat1 - lat2) < tol;
+    };
+
+    return coordsNear(seg1.startLon(), seg1.startLat(),
+                      seg2.startLon(), seg2.startLat(), COORD_TOL) ||
+           coordsNear(seg1.startLon(), seg1.startLat(),
+                      seg2.endLon(), seg2.endLat(), COORD_TOL) ||
+           coordsNear(seg1.endLon(), seg1.endLat(),
+                      seg2.startLon(), seg2.startLat(), COORD_TOL) ||
+           coordsNear(seg1.endLon(), seg1.endLat(),
+                      seg2.endLon(), seg2.endLat(), COORD_TOL);
 }
 
 bool Polygon::isPointInHoleByCoords(double lon, double lat,

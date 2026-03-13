@@ -48,6 +48,7 @@ endfunction()
 # Individual test executables
 add_shipnetsim_test(GPointTest test_gpoint.cpp)
 add_shipnetsim_test(GLineTest test_gline.cpp)
+add_shipnetsim_test(GSegmentTest test_gsegment.cpp)
 add_shipnetsim_test(PolygonTest test_polygon.cpp)
 add_shipnetsim_test(QuadtreeTest test_quadtree.cpp)
 add_shipnetsim_test(HierarchicalVisibilityGraphTest test_hierarchicalvisibilitygraph.cpp)

@@ -46,6 +46,7 @@ add_library(${SHIPNETSIM_CORE_DLL_NAME} SHARED
   ship/langmaomethod.h ship/langmaomethod.cpp
   network/gpoint.h network/gpoint.cpp
   network/gline.h network/gline.cpp
+  network/gsegment.h network/gsegment.cpp
   network/galgebraicvector.h network/galgebraicvector.cpp
   network/seaport.h network/seaport.cpp
   network/dubinspathsmoother.h network/dubinspathsmoother.cpp

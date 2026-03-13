@@ -30,6 +30,7 @@
 #include "gdal_priv.h"
 #include "gline.h"
 #include "gpoint.h"
+#include "gsegment.h"
 #include "ogr_spatialref.h"
 #include <QVector>
 #include <memory>
@@ -143,6 +144,10 @@ private:
      */
     bool isIntersectionAtVertex(const std::shared_ptr<GLine> &segment1,
                                 const std::shared_ptr<GLine> &segment2) const;
+
+    /** @brief Coordinate-based vertex intersection check (no geodesic). */
+    bool isIntersectionAtVertex(const GSegment &seg1,
+                                const GSegment &seg2) const;
 
     /**
      * @brief Point-in-polygon test for a specific hole using raw coordinates.
