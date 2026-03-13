@@ -22,8 +22,11 @@
 
 #include "gline.h"
 #include "gpoint.h"
+#include "gsegment.h"
 #include "polygon.h"
 #include <QRectF>
+#include <array>
+#include <vector>
 
 namespace ShipNetSimCore
 {
@@ -61,16 +64,16 @@ public:
         int quadrant;
         /// Flag to indicate if the node is a leaf.
         bool isLeaf;
-        /// GLine segments contained in the node.
+        /// GLine segments contained in the node (cold path).
         QVector<std::shared_ptr<GLine>> line_segments;
+        /// Flat GSegment storage for hot-path queries (contiguous).
+        std::vector<GSegment> segments;
         /// Pointers to child nodes.
         Node *children[4];
         /// Pointer to the parent node.
         Node *parent;
-        /// Minimum point defining the node's bounding box.
-        std::shared_ptr<GPoint> min_point;
-        /// Maximum point defining the node's bounding box.
-        std::shared_ptr<GPoint> max_point;
+        /// Bounding box as inline doubles (no heap allocation).
+        double minLon, minLat, maxLon, maxLat;
 
         Node(Quadtree *tree, Node *parent = nullptr,
              int quadrant = -1);
@@ -84,13 +87,7 @@ public:
         Node(Node &&other) noexcept            = delete;
         Node &operator=(Node &&other) noexcept = delete;
 
-        // Node(const Node& other);  // Copy constructor
-        // Node(Node&& other) noexcept;  // Move constructor
-        // Node& operator=(const Node& other);  // Copy assignment
-        // operator Node& operator=(Node&& other) noexcept;  // Move
-        // assignment operator
-
-        /// Maximum point defining the node's bounding box.
+        /// Subdivide this node into 4 children.
         void subdivide(Quadtree *tree);
 
         /// Distribute segments to child nodes
@@ -102,6 +99,9 @@ public:
 
         bool doesLineSegmentIntersectNode(
             const std::shared_ptr<GLine> &segment) const;
+
+        /// GSegment overload — pure double arithmetic, no shared_ptr.
+        bool doesSegmentIntersectNode(const GSegment &seg) const;
 
         bool standardIntersectionCheck(
             const std::shared_ptr<GLine> &segment) const;
@@ -116,7 +116,6 @@ public:
 private:
     /// Maximum number of line segments a node can
     /// hold before subdividing.
-    /// leave it to 1 so the visibility graph can work
     const qsizetype MAX_SEGMENTS_PER_NODE = 30;
 
     /// Root node of the quadtree
@@ -125,19 +124,13 @@ private:
     const double tolerance =
         0.1; // Small tolerance for double precision
 
-    std::shared_ptr<GPoint>
-    wrapPoint(const std::shared_ptr<GPoint> &point) const;
-
     void findIntersectingNodesHelper(
         const std::shared_ptr<GLine> &segment, const Node &node,
         QVector<Node *> &intersecting_nodes) const;
 
-    // void findLineSegmentHelper(const Node* node,
-    //                            const std::shared_ptr<GPoint>&
-    //                            point1, const
-    //                            std::shared_ptr<GPoint>& point2,
-    //                            std::shared_ptr<GLine>& result)
-    //                            const;
+    void findIntersectingSegmentHelper(
+        const GSegment &seg, const Node &node,
+        QVector<Node *> &intersecting_nodes) const;
 
     void
     insertLineSegmentHelper(const std::shared_ptr<GLine> &segment,
@@ -197,6 +190,7 @@ private:
      */
     bool segmentIntersectsRange(const std::shared_ptr<GLine> &segment,
                                 const QRectF &range) const;
+
     /**
      * @brief Helper function to recursively delete nodes.
      * @param node The current node to delete.
@@ -251,6 +245,10 @@ public:
     QVector<Quadtree::Node *>
     findNodesIntersectingLineSegmentParallel(
         const std::shared_ptr<GLine> &segment) const;
+
+    /// GSegment overload — zero heap allocations.
+    QVector<Node *> findNodesIntersectingSegment(
+        const GSegment &seg) const;
 
     /**
      * @brief Retrieves all line segments within a given node.
@@ -358,20 +356,73 @@ public:
     static bool isSegmentCrossingAntimeridian(
         const std::shared_ptr<GLine> &segment);
 
+    /// GSegment overload with full antimeridian logic.
+    static bool isSegmentCrossingAntimeridian(const GSegment &seg);
+
     static std::vector<std::shared_ptr<GLine>>
     splitSegmentAtAntimeridian(const std::shared_ptr<GLine> &segment);
 
-    // check if a segment crosses the min X Coordinate GLine
-    // bool getSegmentCrossesMinLongitudeLine(
-    //     const std::shared_ptr<GLine> &segment) const;
+    /// GSegment overload — returns lightweight GSegments.
+    static std::vector<GSegment>
+    splitSegmentAtAntimeridian(const GSegment &seg);
 
-    // /**
-    //  * @brief split Segment At Min Longitude GLine (MLL)
-    //  * @param segment the segment to be split
-    //  * @return a vector of segments that are split at the MLL
-    //  */
-    // QVector<std::shared_ptr<GLine>> splitSegmentAtMinLongitudeLine(
-    //     const std::shared_ptr<GLine>& segment);
+    /**
+     * @brief Visit all GSegments in nodes whose bounds intersect querySeg.
+     *
+     * Uses iterative stack-based DFS. Visits segments at ALL nodes
+     * (both leaf and internal), fixing the existing bug where internal
+     * node segments were missed.
+     *
+     * @param querySeg The query segment
+     * @param callback bool(const GSegment&) — return true to stop early
+     * @return true if callback stopped early (found intersection)
+     */
+    template<typename Func>
+    bool visitSegmentsAlongSegment(const GSegment &querySeg,
+                                   Func &&callback) const
+    {
+        // Handle antimeridian: split and visit each half
+        if (isSegmentCrossingAntimeridian(querySeg))
+        {
+            auto splits = splitSegmentAtAntimeridian(querySeg);
+            for (const auto &s : splits)
+            {
+                if (visitSegmentsAlongSegment(s,
+                        std::forward<Func>(callback)))
+                    return true;
+            }
+            return false;
+        }
+
+        // Iterative DFS with fixed-size stack
+        std::array<const Node*, 128> stack;
+        int top = 0;
+        stack[top++] = &root;
+
+        while (top > 0)
+        {
+            const Node* node = stack[--top];
+            if (!node->doesSegmentIntersectNode(querySeg))
+                continue;
+
+            // Visit segments at this node (both leaf and internal)
+            for (const auto &s : node->segments)
+            {
+                if (callback(s))
+                    return true;
+            }
+
+            if (!node->isLeaf)
+            {
+                for (int i = 3; i >= 0; --i)
+                {
+                    if (node->children[i])
+                        stack[top++] = node->children[i];
+                }
+            }
+        }
+        return false;
+    }
 
     /**
      * @brief Clears the entire Quadtree, deleting all nodes.

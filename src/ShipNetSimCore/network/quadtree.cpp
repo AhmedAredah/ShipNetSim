@@ -22,12 +22,10 @@ Quadtree::Node::Node(Quadtree *tree, Node *parent, int quadrant)
     , quadrant(quadrant)
     , isLeaf(true)
     , parent(parent)
-    , min_point(
-          std::make_shared<GPoint>(units::angle::degree_t(-180.0),
-                                   units::angle::degree_t(-90.0)))
-    , max_point(
-          std::make_shared<GPoint>(units::angle::degree_t(180.0),
-                                   units::angle::degree_t(90.0)))
+    , minLon(-180.0)
+    , minLat(-90.0)
+    , maxLon(180.0)
+    , maxLat(90.0)
 {
     std::fill(std::begin(children), std::end(children), nullptr);
 }
@@ -47,46 +45,23 @@ Quadtree::Node::~Node()
 bool Quadtree::Node::isPointWithinNode(
     const std::shared_ptr<GPoint> &point) const
 {
-    // Check longitude bounds
-    bool withinLongitude =
-        point->getLongitude() >= min_point->getLongitude()
-        && point->getLongitude() <= max_point->getLongitude();
-
-    // Check latitude bounds
-    bool withinLatitude =
-        point->getLatitude() >= min_point->getLatitude()
-        && point->getLatitude() <= max_point->getLatitude();
-
-    return withinLongitude && withinLatitude;
+    double pLon = point->getLongitude().value();
+    double pLat = point->getLatitude().value();
+    return pLon >= minLon && pLon <= maxLon
+        && pLat >= minLat && pLat <= maxLat;
 }
 
 units::length::meter_t Quadtree::Node::distanceFromPointToBoundingBox(
     const std::shared_ptr<GPoint> &point) const
 {
-    // Initialize minDistance with a large value.
-    units::length::meter_t minDistance(
-        std::numeric_limits<double>::max());
-
-    // Get the bounding box corners.
-    units::angle::degree_t minLon = min_point->getLongitude();
-    units::angle::degree_t maxLon = max_point->getLongitude();
-    units::angle::degree_t minLat = min_point->getLatitude();
-    units::angle::degree_t maxLat = max_point->getLatitude();
-
-    // If the point is outside the bounding box in both dimensions,
-    // check corner distances.
-    std::vector<std::shared_ptr<GPoint>> corners = {
-        std::make_shared<GPoint>(minLon, minLat),
-        std::make_shared<GPoint>(minLon, maxLat),
-        std::make_shared<GPoint>(maxLon, minLat),
-        std::make_shared<GPoint>(maxLon, maxLat)};
-
-    for (const auto &corner : corners)
-    {
-        minDistance = std::min(minDistance, point->distance(*corner));
-    }
-
-    return minDistance;
+    double pLon = point->getLongitude().value();
+    double pLat = point->getLatitude().value();
+    double cLon = std::clamp(pLon, minLon, maxLon);
+    double cLat = std::clamp(pLat, minLat, maxLat);
+    if (cLon == pLon && cLat == pLat)
+        return units::length::meter_t(0.0); // point inside box
+    return units::length::meter_t(
+        GSegment::haversineRaw(pLon, pLat, cLon, cLat));
 }
 
 void Quadtree::Node::subdivide(Quadtree *tree)
@@ -113,8 +88,6 @@ void Quadtree::Node::subdivide(Quadtree *tree)
             auto splitSegments = splitSegmentAtAntimeridian(segment);
             for (auto &splitSegment : splitSegments)
             {
-                // Determine which child(ren) the split segment
-                // belongs to and add it there
                 auto r = distributeSegmentToChildren(splitSegment);
                 if (r != nullptr)
                 {
@@ -124,8 +97,6 @@ void Quadtree::Node::subdivide(Quadtree *tree)
         }
         else
         {
-            // For segments not crossing the boundary,
-            // reassign to the correct child
             auto r = distributeSegmentToChildren(segment);
             if (r != nullptr)
             {
@@ -136,9 +107,15 @@ void Quadtree::Node::subdivide(Quadtree *tree)
 
     // Clear the parent node's segments as they are now reassigned
     line_segments.clear();
-    line_segments =
-        segmentsToKeep; // Retain only undistributed segments
-    isLeaf = false;     // This node is no longer a leaf
+    segments.clear();
+    line_segments = segmentsToKeep;
+    // Rebuild segments vector to match
+    segments.reserve(segmentsToKeep.size());
+    for (const auto &seg : segmentsToKeep)
+    {
+        segments.emplace_back(GSegment(seg));
+    }
+    isLeaf = false;
 
     // Recursively subdivide children if they exceed
     // the maximum number of segments.
@@ -161,15 +138,12 @@ std::shared_ptr<GLine> Quadtree::Node::distributeSegmentToChildren(
         if (children[i]->doesLineSegmentIntersectNode(segment))
         {
             children[i]->line_segments.push_back(segment);
+            children[i]->segments.emplace_back(GSegment(segment));
             distributed = true;
-            // Do not break; segment may intersect multiple children
-            // due to wrap-around
         }
     }
     if (!distributed)
     {
-        // handle the case where the segment does not fit cleanly into
-        // any child Keep it at the current node
         return segment;
     }
     return nullptr;
@@ -177,125 +151,20 @@ std::shared_ptr<GLine> Quadtree::Node::distributeSegmentToChildren(
 
 void Quadtree::Node::createChildren(Quadtree *tree)
 {
-    // Calculate the center point of the current node
-    units::angle::degree_t centerLon =
-        (min_point->getLongitude() + max_point->getLongitude()) / 2.0;
-    units::angle::degree_t centerLat =
-        (min_point->getLatitude() + max_point->getLatitude()) / 2.0;
+    double centerLon = (minLon + maxLon) / 2.0;
+    double centerLat = (minLat + maxLat) / 2.0;
 
-    // Create each child node and set its boundaries
     for (int i = 0; i < 4; ++i)
     {
         children[i]         = new Node(tree, this, i);
         children[i]->isLeaf = true;
 
-        // Calculate the boundaries for each child
-        units::angle::degree_t minLon =
-            (i % 2 == 0) ? min_point->getLongitude() : centerLon;
-        units::angle::degree_t maxLon =
-            (i % 2 == 0) ? centerLon : max_point->getLongitude();
-        units::angle::degree_t minLat =
-            (i < 2) ? centerLat : min_point->getLatitude();
-        units::angle::degree_t maxLat =
-            (i < 2) ? max_point->getLatitude() : centerLat;
-
-        children[i]->min_point =
-            std::make_shared<GPoint>(minLon, minLat);
-        children[i]->max_point =
-            std::make_shared<GPoint>(maxLon, maxLat);
+        children[i]->minLon = (i % 2 == 0) ? minLon : centerLon;
+        children[i]->maxLon = (i % 2 == 0) ? centerLon : maxLon;
+        children[i]->minLat = (i < 2) ? centerLat : minLat;
+        children[i]->maxLat = (i < 2) ? maxLat : centerLat;
     }
 }
-
-// bool Quadtree::getSegmentCrossesMinLongitudeLine(
-//     const std::shared_ptr<GLine>& segment) const
-// {
-//     // Get the x-coordinate values of the root's minimum and
-//     maximum points double minLon =
-//     root.min_point->getLongitude().value(); double maxLon =
-//     root.max_point->getLongitude().value();
-
-//     // Extract the x-coordinate values of the start and end points
-//     // of the segment
-//     double startLon =
-//     segment->startPoint()->getLongitude().value(); double endLon =
-//     segment->endPoint()->getLongitude().value();
-
-//     // Check if the segment crosses from one edge of the map to the
-//     other
-//     // A segment crosses the minimum longitude line if one end is
-//     // near the minimum and the other end is near the maximum
-//     bool crossesFromMinToMax = (startLon <= minLon && endLon >=
-//     maxLon); bool crossesFromMaxToMin = (startLon >= maxLon &&
-//     endLon <= minLon);
-
-//     return crossesFromMinToMax || crossesFromMaxToMin;
-// }
-
-// QVector<std::shared_ptr<GLine>>
-// Quadtree::splitSegmentAtMinLongitudeLine(
-//     const std::shared_ptr<GLine>& segment)
-// {
-//     QVector<std::shared_ptr<GLine>> splitSegments;
-
-//     // Extract the x-coordinate values of the root's minimum
-//     // and maximum points
-//     double minLongitude = root.min_point->getLongitude().value();
-//     double maxLongitude = root.max_point->getLongitude().value();
-
-//     // Extract the coordinates of the segment's start and end
-//     points double startLon =
-//     segment->startPoint()->getLongitude().value(); double startLat
-//     = segment->startPoint()->getLatitude().value(); double endLon =
-//     segment->endPoint()->getLongitude().value(); double endLat =
-//     segment->endPoint()->getLongitude().value();
-
-//     // Check if the segment needs to be split
-//     if (!getSegmentCrossesMinLongitudeLine(segment)) {
-//         // If the segment doesn't cross the minimum longitude line,
-//         // return it as is
-//         splitSegments.push_back(segment);
-//         return splitSegments;
-//     }
-
-//     // Calculate the Y-coordinate at the point of crossing the
-//     // minimum longitude line
-//     // Linear interpolation is used to find the intersection point
-//     // on the Y-axis
-//     double ratio = (minLongitude - startLon) / (endLon - startLon);
-//     double crossLat = startLat + ratio * (endLat - startLat);
-
-//     // Create new points at the crossing
-//     std::shared_ptr<GPoint> crossingPointMin =
-//         std::make_shared<GPoint>(units::angle::degree_t(minLongitude),
-//                                  units::angle::degree_t(crossLat));
-//     std::shared_ptr<GPoint> crossingPointMax =
-//         std::make_shared<GPoint>(units::angle::degree_t(maxLongitude),
-//                                  units::angle::degree_t(crossLat));
-
-//     // Split the segment into two at the crossing points
-//     if (startLon < endLon)
-//     {
-//         // Segment crosses from left to right
-//         splitSegments.push_back(
-//             std::make_shared<GLine>(segment->startPoint(),
-//                                    crossingPointMin));
-//         splitSegments.push_back(
-//             std::make_shared<GLine>(crossingPointMax,
-//                                    segment->endPoint()));
-//     }
-//     else
-//     {
-//         // Segment crosses from right to left
-//         splitSegments.push_back(
-//             std::make_shared<GLine>(segment->startPoint(),
-//                                    crossingPointMax));
-//         splitSegments.push_back(
-//             std::make_shared<GLine>(crossingPointMin,
-//                                    segment->endPoint()));
-//     }
-
-//     return splitSegments;
-// }
 
 Quadtree::Quadtree(const QVector<std::shared_ptr<Polygon>> &polygons)
     : root(this)
@@ -303,14 +172,12 @@ Quadtree::Quadtree(const QVector<std::shared_ptr<Polygon>> &polygons)
 
     auto initializeBoundary =
         [this](const std::shared_ptr<GPoint> point) -> void {
-        root.min_point->setLongitude(units::math::min(
-            root.min_point->getLongitude(), point->getLongitude()));
-        root.min_point->setLatitude(units::math::min(
-            root.min_point->getLatitude(), point->getLatitude()));
-        root.max_point->setLongitude(units::math::max(
-            root.max_point->getLongitude(), point->getLongitude()));
-        root.max_point->setLatitude(units::math::max(
-            root.max_point->getLatitude(), point->getLatitude()));
+        double lon = point->getLongitude().value();
+        double lat = point->getLatitude().value();
+        root.minLon = std::min(root.minLon, lon);
+        root.minLat = std::min(root.minLat, lat);
+        root.maxLon = std::max(root.maxLon, lon);
+        root.maxLat = std::max(root.maxLat, lat);
     };
 
     // Initialize the root node's boundary based on polygons
@@ -337,8 +204,8 @@ Quadtree::Quadtree(const QVector<std::shared_ptr<Polygon>> &polygons)
         [this](const std::shared_ptr<GPoint> &start,
                const std::shared_ptr<GPoint> &end) {
             auto segment = std::make_shared<GLine>(start, end);
-
             root.line_segments.push_back(segment);
+            root.segments.emplace_back(GSegment(segment));
         };
 
     // Process each polygon
@@ -462,39 +329,62 @@ void Quadtree::findIntersectingNodesHelper(
     }
 }
 
+// GSegment overload — iterative, zero allocations
+QVector<Quadtree::Node *> Quadtree::findNodesIntersectingSegment(
+    const GSegment &seg) const
+{
+    QVector<Node *> intersecting_nodes;
+
+    if (isSegmentCrossingAntimeridian(seg))
+    {
+        auto splits = splitSegmentAtAntimeridian(seg);
+        for (const auto &s : splits)
+        {
+            findIntersectingSegmentHelper(s, root,
+                                          intersecting_nodes);
+        }
+    }
+    else
+    {
+        findIntersectingSegmentHelper(seg, root, intersecting_nodes);
+    }
+    return intersecting_nodes;
+}
+
+void Quadtree::findIntersectingSegmentHelper(
+    const GSegment &seg, const Node &node,
+    QVector<Node *> &intersecting_nodes) const
+{
+    if (!node.doesSegmentIntersectNode(seg))
+        return;
+
+    if (node.isLeaf)
+    {
+        intersecting_nodes.push_back(const_cast<Node *>(&node));
+    }
+    else
+    {
+        for (const Node *child : node.children)
+        {
+            if (child)
+            {
+                findIntersectingSegmentHelper(seg, *child,
+                                              intersecting_nodes);
+            }
+        }
+    }
+}
+
 bool Quadtree::Node::doesLineSegmentIntersectNode(
     const std::shared_ptr<GLine> &segment) const
 {
-    // Step 1: Standard intersection check.
-    // perform a standard bounding box intersection check.
-    // This is straightforward and involves checking if either
-    // endpoint of the segment is within the node's bounding box or if
-    // any edge of the bounding box intersects the line segment.
     if (standardIntersectionCheck(segment))
     {
         return true;
     }
 
-    // Step 2 & 3: Wrap-around Handling
-    // step 2: Detect if a line segment potentially wraps around the
-    // globe.
-    //          This involves comparing the longitudes of the line
-    //          segment's endpoints against the global boundaries.
-    //          Wrap-around occurs if one endpoint is near the maximum
-    //          longitude while the other is near the minimum
-    //          longitude, considering the map's extent.
-    // step 3: For segments that wrap around, adjust their longitude
-    // values
-    //          for intersection checks. The idea is to "unwrap" the
-    //          segment for the purpose of intersection calculations.
-    //          You might need to split the segment into two: one part
-    //          extending to the right boundary of the map and another
-    //          from the left boundary, effectively treating it as two
-    //          segments for intersection checks.
     if (isSegmentCrossingAntimeridian(segment))
     {
-        // Adjust the segment for wrap-around and
-        // perform the intersection check
         auto adjustedSegments = splitSegmentAtAntimeridian(segment);
         for (const auto &adjSegment : adjustedSegments)
         {
@@ -502,6 +392,78 @@ bool Quadtree::Node::doesLineSegmentIntersectNode(
             {
                 return true;
             }
+        }
+    }
+
+    return false;
+}
+
+// GSegment overload — pure double arithmetic
+bool Quadtree::Node::doesSegmentIntersectNode(
+    const GSegment &seg) const
+{
+    double sx = seg.startLon(), sy = seg.startLat();
+    double ex = seg.endLon(),   ey = seg.endLat();
+
+    // Check if either endpoint is inside the node's bounding box
+    if (sx >= minLon && sx <= maxLon && sy >= minLat && sy <= maxLat)
+        return true;
+    if (ex >= minLon && ex <= maxLon && ey >= minLat && ey <= maxLat)
+        return true;
+
+    // Segment bounding box vs node bounding box — quick reject
+    double segMinLon = std::min(sx, ex);
+    double segMaxLon = std::max(sx, ex);
+    double segMinLat = std::min(sy, ey);
+    double segMaxLat = std::max(sy, ey);
+
+    if (segMaxLon < minLon || segMinLon > maxLon ||
+        segMaxLat < minLat || segMinLat > maxLat)
+        return false;
+
+    // Liang-Barsky parametric clipping
+    double dx = ex - sx;
+    double dy = ey - sy;
+
+    auto clipTest = [](double p, double q,
+                       double &tMin, double &tMax) -> bool {
+        if (std::abs(p) < 1e-15)
+            return q >= 0.0;
+        double t = q / p;
+        if (p < 0.0)
+        {
+            if (t > tMax) return false;
+            if (t > tMin) tMin = t;
+        }
+        else
+        {
+            if (t < tMin) return false;
+            if (t < tMax) tMax = t;
+        }
+        return true;
+    };
+
+    double tMin = 0.0, tMax = 1.0;
+
+    if (!clipTest(-dx, sx - minLon, tMin, tMax)) return false;
+    if (!clipTest( dx, maxLon - sx, tMin, tMax)) return false;
+    if (!clipTest(-dy, sy - minLat, tMin, tMax)) return false;
+    if (!clipTest( dy, maxLat - sy, tMin, tMax)) return false;
+
+    // If Liang-Barsky passes, check antimeridian fallback for
+    // stored polygon edges that may cross the antimeridian
+    if (tMin <= tMax)
+        return true;
+
+    // Antimeridian fallback
+    if (Quadtree::isSegmentCrossingAntimeridian(seg))
+    {
+        auto splits = Quadtree::splitSegmentAtAntimeridian(seg);
+        for (const auto &s : splits)
+        {
+            // Recursive but on a non-crossing segment
+            if (doesSegmentIntersectNode(s))
+                return true;
         }
     }
 
@@ -600,32 +562,77 @@ Quadtree::splitSegmentAtAntimeridian(
     return adjustedSegments;
 }
 
+// GSegment overload — lightweight split
+std::vector<GSegment>
+Quadtree::splitSegmentAtAntimeridian(const GSegment &seg)
+{
+    std::vector<GSegment> result;
+
+    double startLon = seg.startLon();
+    double endLon   = seg.endLon();
+    double startLat = seg.startLat();
+    double endLat   = seg.endLat();
+
+    // Normalize longitudes to [0, 360) range
+    double normStart = fmod((startLon + 360.0), 360.0);
+    double normEnd   = fmod((endLon + 360.0), 360.0);
+
+    bool crossesEW = normStart > 180.0 && normEnd < 180.0;
+    bool crossesWE = normStart < 180.0 && normEnd > 180.0;
+
+    if (!crossesEW && !crossesWE)
+    {
+        result.push_back(seg);
+        return result;
+    }
+
+    // Calculate intersection latitude
+    double ratio =
+        std::abs(normStart - 180.0) / std::abs(normEnd - normStart);
+    double intersectLat = startLat + ratio * (endLat - startLat);
+
+    if (crossesEW)
+    {
+        // start → 180, -180 → end
+        if (std::abs(startLon - 180.0) > 1e-12 ||
+            std::abs(startLat - intersectLat) > 1e-12)
+            result.emplace_back(startLon, startLat, 180.0, intersectLat);
+        if (std::abs(endLon - (-180.0)) > 1e-12 ||
+            std::abs(endLat - intersectLat) > 1e-12)
+            result.emplace_back(-180.0, intersectLat, endLon, endLat);
+    }
+    else
+    {
+        // start → -180, 180 → end (west to east crossing)
+        // Actually: start → 180, -180 → end
+        if (std::abs(startLon - 180.0) > 1e-12 ||
+            std::abs(startLat - intersectLat) > 1e-12)
+            result.emplace_back(startLon, startLat, 180.0, intersectLat);
+        if (std::abs(endLon - (-180.0)) > 1e-12 ||
+            std::abs(endLat - intersectLat) > 1e-12)
+            result.emplace_back(-180.0, intersectLat, endLon, endLat);
+    }
+
+    if (result.empty())
+        result.push_back(seg);
+
+    return result;
+}
+
 bool Quadtree::Node::standardIntersectionCheck(
     const std::shared_ptr<GLine> &segment) const
 {
     // Pure AABB arithmetic — no GLine/GPoint construction, no geodesic math.
-    // Extract raw coordinates once.
-    double nodeMinLon = min_point->getLongitude().value();
-    double nodeMaxLon = max_point->getLongitude().value();
-    double nodeMinLat = min_point->getLatitude().value();
-    double nodeMaxLat = max_point->getLatitude().value();
-
     double sx = segment->startPoint()->getLongitude().value();
     double sy = segment->startPoint()->getLatitude().value();
     double ex = segment->endPoint()->getLongitude().value();
     double ey = segment->endPoint()->getLatitude().value();
 
     // Check if either endpoint is inside the node's bounding box
-    if (sx >= nodeMinLon && sx <= nodeMaxLon &&
-        sy >= nodeMinLat && sy <= nodeMaxLat)
-    {
+    if (sx >= minLon && sx <= maxLon && sy >= minLat && sy <= maxLat)
         return true;
-    }
-    if (ex >= nodeMinLon && ex <= nodeMaxLon &&
-        ey >= nodeMinLat && ey <= nodeMaxLat)
-    {
+    if (ex >= minLon && ex <= maxLon && ey >= minLat && ey <= maxLat)
         return true;
-    }
 
     // Segment bounding box vs node bounding box — quick reject
     double segMinLon = std::min(sx, ex);
@@ -633,29 +640,17 @@ bool Quadtree::Node::standardIntersectionCheck(
     double segMinLat = std::min(sy, ey);
     double segMaxLat = std::max(sy, ey);
 
-    if (segMaxLon < nodeMinLon || segMinLon > nodeMaxLon ||
-        segMaxLat < nodeMinLat || segMinLat > nodeMaxLat)
-    {
+    if (segMaxLon < minLon || segMinLon > maxLon ||
+        segMaxLat < minLat || segMinLat > maxLat)
         return false;
-    }
 
-    // Cohen-Sutherland style: check if the segment crosses
-    // the AABB using a 2D line-segment vs rectangle test.
-    // Test segment against each edge of the rectangle.
     double dx = ex - sx;
     double dy = ey - sy;
 
-    // Helper: test segment (sx,sy)-(ex,ey) against an edge defined by
-    // two corners using cross-product orientation test.
-    // For a segment to cross a rectangle, it must cross at least one edge.
-    // We use parametric line intersection with each of the 4 axis-aligned edges.
-
-    auto clipTest = [](double p, double q, double &tMin, double &tMax) -> bool {
+    auto clipTest = [](double p, double q,
+                       double &tMin, double &tMax) -> bool {
         if (std::abs(p) < 1e-15)
-        {
-            // Parallel to this edge
             return q >= 0.0;
-        }
         double t = q / p;
         if (p < 0.0)
         {
@@ -673,10 +668,10 @@ bool Quadtree::Node::standardIntersectionCheck(
     // Liang-Barsky algorithm for line-segment vs AABB clipping
     double tMin = 0.0, tMax = 1.0;
 
-    if (!clipTest(-dx, sx - nodeMinLon, tMin, tMax)) return false;
-    if (!clipTest( dx, nodeMaxLon - sx, tMin, tMax)) return false;
-    if (!clipTest(-dy, sy - nodeMinLat, tMin, tMax)) return false;
-    if (!clipTest( dy, nodeMaxLat - sy, tMin, tMax)) return false;
+    if (!clipTest(-dx, sx - minLon, tMin, tMax)) return false;
+    if (!clipTest( dx, maxLon - sx, tMin, tMax)) return false;
+    if (!clipTest(-dy, sy - minLat, tMin, tMax)) return false;
+    if (!clipTest( dy, maxLat - sy, tMin, tMax)) return false;
 
     return true;
 }
@@ -712,8 +707,6 @@ bool Quadtree::isSegmentCrossingAntimeridian(
 
         // If either endpoint is at exactly ±180°, the segment is already
         // at the antimeridian boundary and doesn't need splitting
-        // This prevents infinite recursion when splitSegmentAtAntimeridian
-        // creates segments ending at ±180°
         const double BOUNDARY_TOLERANCE = 1e-9;
         if (std::abs(std::abs(startLon) - 180.0) < BOUNDARY_TOLERANCE ||
             std::abs(std::abs(endLon) - 180.0) < BOUNDARY_TOLERANCE)
@@ -742,11 +735,7 @@ bool Quadtree::isSegmentCrossingAntimeridian(
         // Calculate the actual path distance
         double directDist = std::abs(endLon - startLon);
 
-        // If the direct distance is significantly larger than
-        // the shortest possible distance, the segment crosses the
-        // antimeridian
-        const double TOLERANCE =
-            1e-10; // Small tolerance for floating-point comparison
+        const double TOLERANCE = 1e-10;
         return directDist > (lonDiff + TOLERANCE);
     }
     catch (const std::exception &e)
@@ -754,6 +743,47 @@ bool Quadtree::isSegmentCrossingAntimeridian(
         qWarning() << "Exception in antimeridian check:" << e.what();
         return false;
     }
+}
+
+// GSegment overload — replicates full antimeridian logic
+bool Quadtree::isSegmentCrossingAntimeridian(const GSegment &seg)
+{
+    double startLon = seg.startLon();
+    double endLon   = seg.endLon();
+    double startLat = seg.startLat();
+    double endLat   = seg.endLat();
+
+    // Pole handling
+    const double POLE_THRESHOLD = 89.9;
+    if (std::abs(startLat) > POLE_THRESHOLD
+        || std::abs(endLat) > POLE_THRESHOLD)
+        return false;
+
+    // Boundary tolerance — prevents infinite recursion
+    const double BOUNDARY_TOLERANCE = 1e-9;
+    if (std::abs(std::abs(startLon) - 180.0) < BOUNDARY_TOLERANCE ||
+        std::abs(std::abs(endLon) - 180.0) < BOUNDARY_TOLERANCE)
+        return false;
+
+    // Normalize longitudes to [-180, 180]
+    auto normalizeLongitude = [](double lon) -> double {
+        lon = std::fmod(lon + 180.0, 360.0);
+        if (lon < 0)
+            lon += 360.0;
+        return lon - 180.0;
+    };
+
+    startLon = normalizeLongitude(startLon);
+    endLon   = normalizeLongitude(endLon);
+
+    double lonDiff = std::abs(endLon - startLon);
+    if (lonDiff > 180.0)
+        lonDiff = 360.0 - lonDiff;
+
+    double directDist = std::abs(endLon - startLon);
+
+    const double TOLERANCE = 1e-10;
+    return directDist > (lonDiff + TOLERANCE);
 }
 
 QVector<std::shared_ptr<GLine>>
@@ -783,11 +813,9 @@ Quadtree::getAdjacentNodes(const Node *node) const
     QVector<Node *> adjacentNodes;
     if (node == nullptr || node->parent == nullptr)
     {
-        return adjacentNodes; // No adjacent nodes for root or null
-                              // node
+        return adjacentNodes;
     }
 
-    // Lambda to add a node's children if it's not a leaf
     auto addChildren = [&adjacentNodes](const Node *n) {
         if (n != nullptr && !n->isLeaf)
         {
@@ -801,26 +829,25 @@ Quadtree::getAdjacentNodes(const Node *node) const
         }
     };
 
-    // Get parent's siblings that share an edge with the node
     Node *parent   = node->parent;
     int   quadrant = node->quadrant;
     switch (quadrant)
     {
-    case 0:                               // top-left
-        addChildren(parent->children[1]); // top-right of parent
-        addChildren(parent->children[2]); // bottom-left of parent
+    case 0:
+        addChildren(parent->children[1]);
+        addChildren(parent->children[2]);
         break;
-    case 1:                               // top-right
-        addChildren(parent->children[0]); // top-left of parent
-        addChildren(parent->children[3]); // bottom-right of parent
+    case 1:
+        addChildren(parent->children[0]);
+        addChildren(parent->children[3]);
         break;
-    case 2:                               // bottom-left
-        addChildren(parent->children[0]); // top-left of parent
-        addChildren(parent->children[3]); // bottom-right of parent
+    case 2:
+        addChildren(parent->children[0]);
+        addChildren(parent->children[3]);
         break;
-    case 3:                               // bottom-right
-        addChildren(parent->children[1]); // top-right of parent
-        addChildren(parent->children[2]); // bottom-left of parent
+    case 3:
+        addChildren(parent->children[1]);
+        addChildren(parent->children[2]);
         break;
     }
 
@@ -829,29 +856,12 @@ Quadtree::getAdjacentNodes(const Node *node) const
 
 bool Quadtree::isNodeAtLeftEdge(const Node *node) const
 {
-    // Define the left edge X coordinate of your map
-    const double leftEdgeLon = root.min_point->getLongitude().value();
-
-    // Check if the node's bounding box aligns with or
-    // is close to the left edge
-    double nodeMinLon = node->min_point->getLongitude().value();
-
-    // Using a small tolerance value for precision issues
-    return std::abs(nodeMinLon - leftEdgeLon) <= tolerance;
+    return std::abs(node->minLon - root.minLon) <= tolerance;
 }
 
 bool Quadtree::isNodeAtRightEdge(const Node *node) const
 {
-    // Define the right edge X coordinate of your map
-    const double rightEdgeLon =
-        root.max_point->getLongitude().value();
-
-    // Check if the node's bounding box aligns with or
-    // is close to the right edge
-    double nodeMaxLon = node->max_point->getLongitude().value();
-
-    // Using a small tolerance value for precision issues
-    return std::abs(nodeMaxLon - rightEdgeLon) <= tolerance;
+    return std::abs(node->maxLon - root.maxLon) <= tolerance;
 }
 
 QVector<Quadtree::Node *> Quadtree::findNodesOnRightEdge() const
@@ -944,37 +954,6 @@ Quadtree::findLineSegment(const std::shared_ptr<GPoint> &point1,
     return nullptr;
 }
 
-// void Quadtree::findLineSegmentHelper(
-//     const Node* node,
-//     const std::shared_ptr<GPoint>& point1,
-//     const std::shared_ptr<GPoint>& point2,
-//     std::shared_ptr<GLine>& result) const
-// {
-//     if (!node || result)
-//     {
-//         return;
-//     }
-
-//     for (const std::shared_ptr<GLine>& line : node->line_segments)
-//     {
-//         if ((*line->startPoint() == *point1 &&
-//              *line->endPoint() == *point2) ||
-//             (*line->startPoint() == *point2 &&
-//              *line->endPoint() == *point1))
-//         {
-//             result = line;
-//             return;
-//         }
-//     }
-
-//     // recursion to find the line
-//     if (!node->isLeaf) {
-//         for (const Node* child : node->children) {
-//             findLineSegmentHelper(child, point1, point2, result);
-//         }
-//     }
-// }
-
 void Quadtree::insertLineSegment(
     const std::shared_ptr<GLine> &segment)
 {
@@ -1005,11 +984,10 @@ void Quadtree::insertLineSegmentHelper(
 
     if (node->isLeaf)
     {
-        // If the node is a leaf and can still accommodate more
-        // segments
         if (node->line_segments.size() < MAX_SEGMENTS_PER_NODE)
         {
             node->line_segments.push_back(segment);
+            node->segments.emplace_back(GSegment(segment));
         }
         else
         {
@@ -1029,8 +1007,6 @@ void Quadtree::insertLineSegmentHelper(
     }
     else
     {
-        // If the node is not a leaf, insert the segment
-        // into the appropriate child nodes
         for (int i = 0; i < 4; ++i)
         {
             if (node->children[i]->doesLineSegmentIntersectNode(
@@ -1057,7 +1033,7 @@ bool Quadtree::deleteLineSegmentHelper(
     // Check if the segment intersects the node's bounding box
     if (!(*node).doesLineSegmentIntersectNode(segment))
     {
-        return false; // Segment does not intersect this node
+        return false;
     }
 
     if (node->isLeaf)
@@ -1067,8 +1043,13 @@ bool Quadtree::deleteLineSegmentHelper(
                             node->line_segments.end(), segment);
         if (it != node->line_segments.end())
         {
-            // If found, erase it
+            size_t idx = std::distance(node->line_segments.begin(), it);
             node->line_segments.erase(it);
+            if (idx < node->segments.size())
+            {
+                node->segments.erase(node->segments.begin()
+                                     + static_cast<ptrdiff_t>(idx));
+            }
             return true;
         }
     }
@@ -1125,10 +1106,8 @@ Quadtree::rangeQueryParallel(const QRectF &range) const
                 return;
 
             QRectF nodeBounds(
-                QPointF(node->min_point->getLongitude().value(),
-                        node->min_point->getLatitude().value()),
-                QPointF(node->max_point->getLongitude().value(),
-                        node->max_point->getLatitude().value()));
+                QPointF(node->minLon, node->minLat),
+                QPointF(node->maxLon, node->maxLat));
 
             if (range.intersects(nodeBounds))
             {
@@ -1203,10 +1182,8 @@ void Quadtree::rangeQueryHelper(
 
     // Create bounding box in degrees
     QRectF nodeBoundingBox(
-        QPointF(node->min_point->getLongitude().value(),
-                node->min_point->getLatitude().value()),
-        QPointF(node->max_point->getLongitude().value(),
-                node->max_point->getLatitude().value()));
+        QPointF(node->minLon, node->minLat),
+        QPointF(node->maxLon, node->maxLat));
 
     if (!range.intersects(nodeBoundingBox))
     {
@@ -1218,7 +1195,6 @@ void Quadtree::rangeQueryHelper(
         for (const std::shared_ptr<GLine> &segment :
              node->line_segments)
         {
-            // Check segments in degrees
             if (segmentIntersectsRange(segment, range))
             {
                 foundSegments.push_back(segment);
@@ -1237,7 +1213,7 @@ void Quadtree::rangeQueryHelper(
 bool Quadtree::segmentIntersectsRange(
     const std::shared_ptr<GLine> &segment, const QRectF &range) const
 {
-    // Use GSegment for fast AABB intersection — no GPoint/GLine construction
+    // Use GSegment for fast AABB intersection
     GSegment seg(segment);
     return seg.intersectsAABB(range.left(), range.top(),
                               range.right(), range.bottom());
@@ -1255,18 +1231,14 @@ Quadtree::findVerticesInRange(const QRectF &range) const
     double minLat = range.top();
     double maxLat = range.bottom();
 
-    // Handle QRectF coordinate system (top < bottom in screen coords,
-    // but we use geographic where lat increases upward)
     if (minLat > maxLat)
     {
         std::swap(minLat, maxLat);
     }
 
-    // Use unordered_set with custom hash/equal for deduplication
     std::unordered_set<std::shared_ptr<GPoint>, GPoint::Hash, GPoint::Equal>
         uniqueVertices;
 
-    // Lambda to check if a point is within the range
     auto isPointInRange = [&](const std::shared_ptr<GPoint> &point) -> bool {
         double lon = point->getLongitude().value();
         double lat = point->getLatitude().value();
@@ -1274,7 +1246,6 @@ Quadtree::findVerticesInRange(const QRectF &range) const
                lat >= minLat && lat <= maxLat;
     };
 
-    // Extract unique vertices from segments
     for (const auto &segment : segments)
     {
         if (isPointInRange(segment->startPoint()))
@@ -1287,7 +1258,6 @@ Quadtree::findVerticesInRange(const QRectF &range) const
         }
     }
 
-    // Convert to QVector
     QVector<std::shared_ptr<GPoint>> result;
     result.reserve(uniqueVertices.size());
     for (const auto &vertex : uniqueVertices)
@@ -1318,18 +1288,15 @@ void Quadtree::findNearestNeighborHelper(
     if (!node)
         return;
 
-    // Calculate the distance from the point to the node's bounding
-    // box
     units::length::meter_t distanceToNode =
         distanceFromPointToNode(point, node);
     if (distanceToNode > minDistance)
     {
-        return; // Node is too far to contain the nearest neighbor
+        return;
     }
 
     if (node->isLeaf)
     {
-        // Check each line segment in the leaf node
         for (const auto &segment : node->line_segments)
         {
             units::length::meter_t distance =
@@ -1343,7 +1310,6 @@ void Quadtree::findNearestNeighborHelper(
     }
     else
     {
-        // If the node is not a leaf, recurse into its children
         for (const Node *child : node->children)
         {
             findNearestNeighborHelper(point, child, nearestSegment,
@@ -1361,58 +1327,14 @@ units::length::meter_t Quadtree::distanceFromPointToNode(
             std::numeric_limits<double>::max());
     }
 
-    // Initialize minimum distance to a large value
-    units::length::meter_t minDistance =
-        units::length::meter_t(std::numeric_limits<double>::max());
-
-    // Create points for each corner of the node
-    std::shared_ptr<GPoint> corners[4] = {
-        node->min_point, // Bottom-left
-        std::make_shared<GPoint>(
-            node->min_point->getLongitude(),
-            node->max_point->getLatitude()), // Top-left
-        node->max_point,                     // Top-right
-        std::make_shared<GPoint>(
-            node->max_point->getLongitude(),
-            node->min_point->getLatitude()) // Bottom-right
-    };
-
-    // Check distance from the point to each corner
-    for (int i = 0; i < 4; ++i)
-    {
-        units::length::meter_t distance =
-            point->distance(*corners[i]);
-        minDistance = std::min(minDistance, distance);
-    }
-
-    // Additionally, check if the point is directly north, south,
-    // east, or west of the node and compare those distances
-    // to the minDistance
-    std::shared_ptr<GPoint> edges[4] = {
-        std::make_shared<GPoint>(
-            point->getLongitude(),
-            node->min_point->getLatitude()), // Directly south
-        std::make_shared<GPoint>(
-            point->getLongitude(),
-            node->max_point->getLatitude()), // Directly north
-        std::make_shared<GPoint>(
-            node->min_point->getLongitude(),
-            point->getLatitude()), // Directly west
-        std::make_shared<GPoint>(
-            node->max_point->getLongitude(),
-            point->getLatitude()) // Directly east
-    };
-
-    for (int i = 0; i < 4; ++i)
-    {
-        units::length::meter_t distance = point->distance(*edges[i]);
-        if (distance.value() < minDistance.value())
-        {
-            minDistance = distance;
-        }
-    }
-
-    return minDistance;
+    double pLon = point->getLongitude().value();
+    double pLat = point->getLatitude().value();
+    double cLon = std::clamp(pLon, node->minLon, node->maxLon);
+    double cLat = std::clamp(pLat, node->minLat, node->maxLat);
+    if (cLon == pLon && cLat == pLat)
+        return units::length::meter_t(0.0); // point inside box
+    return units::length::meter_t(
+        GSegment::haversineRaw(pLon, pLat, cLon, cLat));
 }
 
 std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
@@ -1421,10 +1343,8 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
     std::shared_ptr<GPoint> nearestPoint = nullptr;
     units::length::meter_t  minDistance(
         std::numeric_limits<double>::max());
-    QMutex mutex;
 
     // Create priority queue of nodes sorted by distance to target
-    // point
     struct NodeDist
     {
         const Node            *node;
@@ -1461,8 +1381,7 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
             if (node->line_segments.size()
                 > MIN_SEGMENTS_FOR_PARALLEL)
             {
-                // Parallel processing for large nodes using Qt
-                // concurrent
+                // Parallel processing for large nodes
                 auto futurePoints = QtConcurrent::mapped(
                     node->line_segments,
                     [&point](const std::shared_ptr<GLine> &segment) {
@@ -1472,13 +1391,11 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
                             units::length::meter_t  distance;
                         };
 
-                        // Check start point
                         PointDist result;
                         result.distance =
                             point->distance(*segment->startPoint());
                         result.point = segment->startPoint();
 
-                        // Check end point
                         auto endDist =
                             point->distance(*segment->endPoint());
                         if (endDist < result.distance)
@@ -1492,9 +1409,7 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
 
                 futurePoints.waitForFinished();
 
-                // Process results
-                auto         results = futurePoints.results();
-                QMutexLocker locker(&mutex);
+                auto results = futurePoints.results();
                 for (const auto &result : results)
                 {
                     if (result.distance < minDistance)
@@ -1514,7 +1429,6 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
                     auto endDist =
                         point->distance(*segment->endPoint());
 
-                    QMutexLocker locker(&mutex);
                     if (startDist < minDistance)
                     {
                         minDistance  = startDist;
@@ -1536,8 +1450,6 @@ std::shared_ptr<GPoint> Quadtree::findNearestNeighborPoint(
                 if (!child)
                     continue;
 
-                // Only add nodes that could potentially have closer
-                // points
                 units::length::meter_t childDist =
                     child->distanceFromPointToBoundingBox(point);
                 if (childDist < minDistance)
@@ -1570,21 +1482,16 @@ void Quadtree::clearTree()
     // Recursively clear the tree starting from the root
     clearTreeHelper(&root);
 
-    // Reset the root node's properties instead of assigning a new
-    // node
+    // Reset the root node's properties
     root.host     = this;
     root.quadrant = -1;
-    root.isLeaf =
-        true; // Assuming the root becomes a leaf after clearing
+    root.isLeaf   = true;
     root.line_segments.clear();
-    root.min_point = std::make_shared<GPoint>(); // Reset to default
-    root.max_point = std::make_shared<GPoint>(); // Reset to default
-
-    // Reset to global boundaries
-    root.min_point->setLongitude(units::angle::degree_t(-180.0));
-    root.min_point->setLatitude(units::angle::degree_t(-90.0));
-    root.max_point->setLongitude(units::angle::degree_t(180.0));
-    root.max_point->setLatitude(units::angle::degree_t(90.0));
+    root.segments.clear();
+    root.minLon = -180.0;
+    root.minLat = -90.0;
+    root.maxLon = 180.0;
+    root.maxLat = 90.0;
 
     // Initialize children pointers to nullptr
     std::fill(std::begin(root.children), std::end(root.children),
@@ -1634,11 +1541,13 @@ void Quadtree::clearTreeHelper(Node *node)
     for (Node *nodeToDelete : nodesToDelete)
     {
         nodeToDelete->line_segments.clear();
+        nodeToDelete->segments.clear();
         delete nodeToDelete;
     }
 
     // Clear root node data
     node->line_segments.clear();
+    node->segments.clear();
     std::fill(std::begin(node->children), std::end(node->children),
               nullptr);
 }
@@ -1663,14 +1572,18 @@ void Quadtree::serializeNode(std::ostream &out,
               sizeof(isNull));
     if (isNull)
     {
-        return; // If the node is null, there's nothing more to
-                // serialize
+        return;
     }
 
-    // Serialize the min and max points using GPoint's serialization
-    // method
-    node->min_point->serialize(out);
-    node->max_point->serialize(out);
+    // Serialize bounds as 4 doubles
+    out.write(reinterpret_cast<const char *>(&node->minLon),
+              sizeof(double));
+    out.write(reinterpret_cast<const char *>(&node->minLat),
+              sizeof(double));
+    out.write(reinterpret_cast<const char *>(&node->maxLon),
+              sizeof(double));
+    out.write(reinterpret_cast<const char *>(&node->maxLat),
+              sizeof(double));
 
     // Serialize line segments
     std::uint64_t numSegments =
@@ -1733,9 +1646,15 @@ void Quadtree::deserializeNode(std::istream &in, Node *parentNode)
     if (isNull)
         return;
 
-    // 2. Deserialize node data into EXISTING node structure
-    parentNode->min_point->deserialize(in);
-    parentNode->max_point->deserialize(in);
+    // 2. Deserialize bounds as 4 doubles
+    in.read(reinterpret_cast<char *>(&parentNode->minLon),
+            sizeof(double));
+    in.read(reinterpret_cast<char *>(&parentNode->minLat),
+            sizeof(double));
+    in.read(reinterpret_cast<char *>(&parentNode->maxLon),
+            sizeof(double));
+    in.read(reinterpret_cast<char *>(&parentNode->maxLat),
+            sizeof(double));
 
     // 3. Deserialize line segments
     std::uint64_t numSegments;
@@ -1743,6 +1662,8 @@ void Quadtree::deserializeNode(std::istream &in, Node *parentNode)
             sizeof(numSegments));
     parentNode->line_segments.clear();
     parentNode->line_segments.reserve(numSegments);
+    parentNode->segments.clear();
+    parentNode->segments.reserve(numSegments);
 
     for (std::uint64_t i = 0; i < numSegments; ++i)
     {
@@ -1750,8 +1671,9 @@ void Quadtree::deserializeNode(std::istream &in, Node *parentNode)
         auto end   = std::make_shared<GPoint>();
         start->deserialize(in);
         end->deserialize(in);
-        parentNode->line_segments.emplace_back(
-            std::make_shared<GLine>(start, end));
+        auto seg = std::make_shared<GLine>(start, end);
+        parentNode->line_segments.emplace_back(seg);
+        parentNode->segments.emplace_back(GSegment(seg));
     }
 
     // 4. Deserialize leaf status
@@ -1763,20 +1685,15 @@ void Quadtree::deserializeNode(std::istream &in, Node *parentNode)
     {
         for (int i = 0; i < 4; ++i)
         {
-            // Create new child with proper parent relationship
             parentNode->children[i] = new Node(this, parentNode, i);
             deserializeNode(in, parentNode->children[i]);
 
             // Validate quadrant boundaries
             const auto &child = parentNode->children[i];
-            if (child->min_point->getLongitude()
-                    < parentNode->min_point->getLongitude()
-                || child->max_point->getLongitude()
-                       > parentNode->max_point->getLongitude()
-                || child->min_point->getLatitude()
-                       < parentNode->min_point->getLatitude()
-                || child->max_point->getLatitude()
-                       > parentNode->max_point->getLatitude())
+            if (child->minLon < parentNode->minLon
+                || child->maxLon > parentNode->maxLon
+                || child->minLat < parentNode->minLat
+                || child->maxLat > parentNode->maxLat)
             {
                 throw std::runtime_error("Child node boundaries "
                                          "exceed parent limits");
@@ -1798,36 +1715,33 @@ Quadtree::Quadtree()
 
 units::angle::degree_t Quadtree::getMapWidth() const
 {
-    return (root.max_point->getLongitude()
-            - root.min_point->getLongitude());
+    return units::angle::degree_t(root.maxLon - root.minLon);
 }
 
 units::angle::degree_t Quadtree::getMapHeight() const
 {
-    return (root.max_point->getLatitude()
-            - root.min_point->getLatitude());
+    return units::angle::degree_t(root.maxLat - root.minLat);
 }
 
 bool Quadtree::isNearBoundary(
     const std::shared_ptr<GPoint> &point) const
 {
-    // Check if the point is near the left or right boundary
-    return (std::abs(point->getLongitude().value()
-                     - root.min_point->getLongitude().value())
+    return (std::abs(point->getLongitude().value() - root.minLon)
             < tolerance)
-           || (std::abs(point->getLongitude().value()
-                        - root.max_point->getLongitude().value())
+           || (std::abs(point->getLongitude().value() - root.maxLon)
                < tolerance);
 }
 
 GPoint Quadtree::getMapMinPoint() const
 {
-    return *(root.min_point);
+    return GPoint(units::angle::degree_t(root.minLon),
+                  units::angle::degree_t(root.minLat));
 }
 
 GPoint Quadtree::getMapMaxPoint() const
 {
-    return *(root.max_point);
+    return GPoint(units::angle::degree_t(root.maxLon),
+                  units::angle::degree_t(root.maxLat));
 }
 
 }; // namespace ShipNetSimCore
