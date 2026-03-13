@@ -54,60 +54,76 @@ loadPolygonsFromShapefile(const QString& filepath)
     poLayer->ResetReading();
 
     int shapeID = 0;
+
+    // Process a single OGRPolygon into a Polygon and append to result
+    auto processOGRPolygon = [&](OGRPolygon* poPolygon) {
+        OGRLinearRing* poExteriorRing = poPolygon->getExteriorRing();
+
+        QVector<std::shared_ptr<GPoint>> exteriorRing;
+        if (poExteriorRing != nullptr)
+        {
+            int nPoints = poExteriorRing->getNumPoints();
+            for (int i = 0; i < nPoints; i++)
+            {
+                double x = poExteriorRing->getX(i);
+                double y = poExteriorRing->getY(i);
+                exteriorRing.push_back(
+                    std::make_shared<GPoint>(
+                        units::angle::degree_t(x),
+                        units::angle::degree_t(y)));
+            }
+            shapeID++;
+        }
+
+        int nInteriorRings = poPolygon->getNumInteriorRings();
+        QVector<QVector<std::shared_ptr<GPoint>>> innerHoles(
+            nInteriorRings);
+
+        for (int i = 0; i < nInteriorRings; i++)
+        {
+            OGRLinearRing* poInteriorRing =
+                poPolygon->getInteriorRing(i);
+            int nPoints = poInteriorRing->getNumPoints();
+            for (int j = 0; j < nPoints; j++)
+            {
+                double x = poInteriorRing->getX(j);
+                double y = poInteriorRing->getY(j);
+                innerHoles[i].push_back(
+                    std::make_shared<GPoint>(
+                        units::angle::degree_t(x),
+                        units::angle::degree_t(y)));
+            }
+        }
+
+        auto polygon = std::make_shared<Polygon>(
+            exteriorRing, innerHoles,
+            QString::number(shapeID));
+        polygons.push_back(polygon);
+    };
+
     OGRFeature* poFeature;
     while ((poFeature = poLayer->GetNextFeature()) != nullptr)
     {
         OGRGeometry* poGeometry = poFeature->GetGeometryRef();
-        if (poGeometry != nullptr
-            && wkbFlatten(poGeometry->getGeometryType()) == wkbPolygon)
+        if (poGeometry != nullptr)
         {
-            OGRPolygon* poPolygon =
-                static_cast<OGRPolygon*>(poGeometry);
-            OGRLinearRing* poExteriorRing =
-                poPolygon->getExteriorRing();
+            auto geomType = wkbFlatten(poGeometry->getGeometryType());
 
-            // Read exterior ring
-            QVector<std::shared_ptr<GPoint>> exteriorRing;
-            if (poExteriorRing != nullptr)
+            if (geomType == wkbPolygon)
             {
-                int nPoints = poExteriorRing->getNumPoints();
-                for (int i = 0; i < nPoints; i++)
-                {
-                    double x = poExteriorRing->getX(i);
-                    double y = poExteriorRing->getY(i);
-                    exteriorRing.push_back(
-                        std::make_shared<GPoint>(
-                            units::angle::degree_t(x),
-                            units::angle::degree_t(y)));
-                }
-                shapeID++;
+                processOGRPolygon(
+                    static_cast<OGRPolygon*>(poGeometry));
             }
-
-            // Read interior rings (holes)
-            int nInteriorRings = poPolygon->getNumInteriorRings();
-            QVector<QVector<std::shared_ptr<GPoint>>> innerHoles(
-                nInteriorRings);
-
-            for (int i = 0; i < nInteriorRings; i++)
+            else if (geomType == wkbMultiPolygon)
             {
-                OGRLinearRing* poInteriorRing =
-                    poPolygon->getInteriorRing(i);
-                int nPoints = poInteriorRing->getNumPoints();
-                for (int j = 0; j < nPoints; j++)
+                OGRMultiPolygon* poMulti =
+                    static_cast<OGRMultiPolygon*>(poGeometry);
+                for (int g = 0; g < poMulti->getNumGeometries(); g++)
                 {
-                    double x = poInteriorRing->getX(j);
-                    double y = poInteriorRing->getY(j);
-                    innerHoles[i].push_back(
-                        std::make_shared<GPoint>(
-                            units::angle::degree_t(x),
-                            units::angle::degree_t(y)));
+                    processOGRPolygon(static_cast<OGRPolygon*>(
+                        poMulti->getGeometryRef(g)));
                 }
             }
-
-            auto polygon = std::make_shared<Polygon>(
-                exteriorRing, innerHoles,
-                QString::number(shapeID));
-            polygons.push_back(polygon);
         }
         OGRFeature::DestroyFeature(poFeature);
     }
