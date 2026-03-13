@@ -425,99 +425,110 @@ void OptimizedNetwork::loadPolygonShapeFile(const QString &filepath)
     poLayer->ResetReading();
 
     int shapeID = 0;
+
+    // Process a single OGRPolygon into a Polygon and append to mBoundaries
+    auto processOGRPolygon = [&](OGRPolygon *poPolygon) {
+        OGRLinearRing *poExteriorRing = poPolygon->getExteriorRing();
+
+        QVector<std::shared_ptr<GPoint>> exteriorRing;
+        if (poExteriorRing != NULL)
+        {
+            int nPoints = poExteriorRing->getNumPoints();
+            for (int i = 0; i < nPoints; i++)
+            {
+                double x = poExteriorRing->getX(i);
+                double y = poExteriorRing->getY(i);
+
+                try
+                {
+                    exteriorRing.push_back(
+                        std::make_shared<GPoint>(
+                            GPoint(units::angle::degree_t(x),
+                                   units::angle::degree_t(y))));
+                }
+                catch (const std::exception &e)
+                {
+                    QString errorMsg =
+                        QString("Failed to create GPoint: %1")
+                            .arg(e.what());
+                    emit errorOccurred(errorMsg);
+                    throw;
+                }
+            }
+
+            shapeID++;
+        }
+
+        int nInteriorRings = poPolygon->getNumInteriorRings();
+        QVector<QVector<std::shared_ptr<GPoint>>> innerHoles(
+            nInteriorRings);
+
+        for (int i = 0; i < nInteriorRings; i++)
+        {
+            OGRLinearRing *poInteriorRing =
+                poPolygon->getInteriorRing(i);
+            int nPoints = poInteriorRing->getNumPoints();
+            for (int j = 0; j < nPoints; j++)
+            {
+                double x = poInteriorRing->getX(j);
+                double y = poInteriorRing->getY(j);
+
+                try
+                {
+                    innerHoles[i].push_back(
+                        std::make_shared<GPoint>(
+                            GPoint(units::angle::degree_t(x),
+                                   units::angle::degree_t(y))));
+                }
+                catch (const std::exception &e)
+                {
+                    QString errorMsg =
+                        QString("Failed to create GPoint: %1")
+                            .arg(e.what());
+                    emit errorOccurred(errorMsg);
+                    throw;
+                }
+            }
+        }
+
+        try
+        {
+            auto polygon = std::make_shared<Polygon>(
+                exteriorRing, innerHoles,
+                QString::number(shapeID));
+            mBoundaries.push_back(polygon);
+        }
+        catch (const std::exception &e)
+        {
+            QString errorMsg =
+                QString("Failed to create Polygon: %1")
+                    .arg(e.what());
+            emit errorOccurred(errorMsg);
+            throw;
+        }
+    };
+
     while ((poFeature = poLayer->GetNextFeature()) != NULL)
     {
-        OGRGeometry *poGeometry;
-        poGeometry = poFeature->GetGeometryRef();
-        if (poGeometry != NULL
-            && wkbFlatten(poGeometry->getGeometryType())
-                   == wkbPolygon)
+        OGRGeometry *poGeometry = poFeature->GetGeometryRef();
+        if (poGeometry != NULL)
         {
-            OGRPolygon *poPolygon =
-                static_cast<OGRPolygon *>(poGeometry);
-            OGRLinearRing *poExteriorRing =
-                poPolygon->getExteriorRing();
+            auto geomType = wkbFlatten(poGeometry->getGeometryType());
 
-            // read exterior ring
-            QVector<std::shared_ptr<GPoint>> exterirorRinge =
-                QVector<std::shared_ptr<GPoint>>();
-            if (poExteriorRing != NULL)
+            if (geomType == wkbPolygon)
             {
-                int nPoints = poExteriorRing->getNumPoints();
-                for (int i = 0; i < nPoints; i++)
+                processOGRPolygon(
+                    static_cast<OGRPolygon *>(poGeometry));
+            }
+            else if (geomType == wkbMultiPolygon)
+            {
+                OGRMultiPolygon *poMulti =
+                    static_cast<OGRMultiPolygon *>(poGeometry);
+                for (int g = 0; g < poMulti->getNumGeometries(); g++)
                 {
-                    double x = poExteriorRing->getX(i);
-                    double y = poExteriorRing->getY(i);
-
-                    try
-                    {
-                        exterirorRinge.push_back(
-                            std::make_shared<GPoint>(
-                                GPoint(units::angle::degree_t(x),
-                                       units::angle::degree_t(y))));
-                    }
-                    catch (const std::exception &e)
-                    {
-                        QString errorMsg =
-                            QString("Failed to create GPoint: %1")
-                                .arg(e.what());
-                        emit errorOccurred(errorMsg);
-                        throw;
-                    }
+                    processOGRPolygon(static_cast<OGRPolygon *>(
+                        poMulti->getGeometryRef(g)));
                 }
-
-                shapeID++; // increment the id
-            }
-
-            // read interior ring
-            // Iterate over interior rings (holes) if necessary
-            int nInteriorRings = poPolygon->getNumInteriorRings();
-            QVector<QVector<std::shared_ptr<GPoint>>> innerHoles =
-                QVector<QVector<std::shared_ptr<GPoint>>>(
-                    nInteriorRings);
-
-            for (int i = 0; i < nInteriorRings; i++)
-            {
-                OGRLinearRing *poInteriorRing =
-                    poPolygon->getInteriorRing(i);
-                int nPoints = poInteriorRing->getNumPoints();
-                for (int j = 0; j < nPoints; j++)
-                {
-                    double x = poInteriorRing->getX(j);
-                    double y = poInteriorRing->getY(j);
-
-                    try
-                    {
-                        innerHoles[i].push_back(
-                            std::make_shared<GPoint>(
-                                GPoint(units::angle::degree_t(x),
-                                       units::angle::degree_t(y))));
-                    }
-                    catch (const std::exception &e)
-                    {
-                        QString errorMsg =
-                            QString("Failed to create GPoint: %1")
-                                .arg(e.what());
-                        emit errorOccurred(errorMsg);
-                        throw;
-                    }
-                }
-            }
-
-            try
-            {
-                auto polygon = std::make_shared<Polygon>(
-                    exterirorRinge, innerHoles,
-                    QString::number(shapeID));
-                mBoundaries.push_back(polygon);
-            }
-            catch (const std::exception &e)
-            {
-                QString errorMsg =
-                    QString("Failed to create Polygon: %1")
-                        .arg(e.what());
-                emit errorOccurred(errorMsg);
-                throw;
             }
         }
         OGRFeature::DestroyFeature(poFeature);
