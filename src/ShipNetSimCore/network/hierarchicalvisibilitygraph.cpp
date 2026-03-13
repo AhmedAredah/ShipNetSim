@@ -1056,11 +1056,7 @@ bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
         }
     }
 
-    // Quadtree edge intersection check — use GSegment throughout
-    auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
-    auto intersectingNodes =
-        lvl.quadtree->findNodesIntersectingLineSegmentParallel(segLine);
-
+    // Quadtree edge intersection check — zero-allocation visitor pattern
     double startLon = seg.startLon();
     double endLon = seg.endLon();
     double startLat = seg.startLat();
@@ -1096,74 +1092,62 @@ bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
         segMaxLon = std::max(startLon, endLon);
     }
 
-    // Build query GSegment once for all intersection tests
-    auto checkEdge = [&](const std::shared_ptr<GLine>& edge) {
-        auto edgeStartPt = edge->startPoint();
-        auto edgeEndPt = edge->endPoint();
-        double eLon1 = edgeStartPt->getLongitude().value();
-        double eLat1 = edgeStartPt->getLatitude().value();
-        double eLon2 = edgeEndPt->getLongitude().value();
-        double eLat2 = edgeEndPt->getLatitude().value();
+    bool blocked = lvl.quadtree->visitSegmentsAlongSegment(seg,
+        [&](const GSegment& edge) -> bool {
+            double eLon1 = edge.startLon(), eLat1 = edge.startLat();
+            double eLon2 = edge.endLon(),   eLat2 = edge.endLat();
 
-        if (std::abs(eLon1 - eLon2) > 180.0)
-            return false;
-
-        double edgeMinLon = std::min(eLon1, eLon2);
-        double edgeMaxLon = std::max(eLon1, eLon2);
-        double edgeMinLat = std::min(eLat1, eLat2);
-        double edgeMaxLat = std::max(eLat1, eLat2);
-
-        if (edgeMaxLon < segMinLon || edgeMinLon > segMaxLon
-            || edgeMaxLat < segMinLat || edgeMinLat > segMaxLat)
-            return false;
-
-        const double COORD_TOL = 0.00001;
-        auto coordsNear = [COORD_TOL](double lon1, double lat1,
-                                       double lon2, double lat2) {
-            return std::abs(lon1 - lon2) < COORD_TOL
-                && std::abs(lat1 - lat2) < COORD_TOL;
-        };
-
-        bool sharesEndpoint =
-            coordsNear(eLon1, eLat1, startLon, startLat) ||
-            coordsNear(eLon1, eLat1, endLon, endLat) ||
-            coordsNear(eLon2, eLat2, startLon, startLat) ||
-            coordsNear(eLon2, eLat2, endLon, endLat);
-
-        if (sharesEndpoint)
-            return false;
-
-        auto pointOnEdgeFast = [&](double pLon, double pLat) {
-            if (pLon < edgeMinLon - COORD_TOL || pLon > edgeMaxLon + COORD_TOL ||
-                pLat < edgeMinLat - COORD_TOL || pLat > edgeMaxLat + COORD_TOL)
+            if (std::abs(eLon1 - eLon2) > 180.0)
                 return false;
 
-            double dx = eLon2 - eLon1;
-            double dy = eLat2 - eLat1;
-            double dpx = pLon - eLon1;
-            double dpy = pLat - eLat1;
-            double cross = dx * dpy - dy * dpx;
-            double lenSq = dx * dx + dy * dy;
-            return (cross * cross) < (COORD_TOL * COORD_TOL * lenSq * 100.0);
-        };
+            double edgeMinLon = std::min(eLon1, eLon2);
+            double edgeMaxLon = std::max(eLon1, eLon2);
+            double edgeMinLat = std::min(eLat1, eLat2);
+            double edgeMaxLat = std::max(eLat1, eLat2);
 
-        if (pointOnEdgeFast(startLon, startLat) ||
-            pointOnEdgeFast(endLon, endLat))
-            return false;
-
-        // Use GSegment intersection instead of GLine::intersects
-        GSegment edgeSeg(eLon1, eLat1, eLon2, eLat2);
-        return seg.intersects(edgeSeg, false);
-    };
-
-    for (auto* node : intersectingNodes)
-    {
-        for (const auto& edge : lvl.quadtree->getAllSegmentsInNode(node))
-        {
-            if (checkEdge(edge))
+            if (edgeMaxLon < segMinLon || edgeMinLon > segMaxLon
+                || edgeMaxLat < segMinLat || edgeMinLat > segMaxLat)
                 return false;
-        }
-    }
+
+            const double COORD_TOL = 0.00001;
+            auto coordsNear = [COORD_TOL](double lon1, double lat1,
+                                           double lon2, double lat2) {
+                return std::abs(lon1 - lon2) < COORD_TOL
+                    && std::abs(lat1 - lat2) < COORD_TOL;
+            };
+
+            bool sharesEndpoint =
+                coordsNear(eLon1, eLat1, startLon, startLat) ||
+                coordsNear(eLon1, eLat1, endLon, endLat) ||
+                coordsNear(eLon2, eLat2, startLon, startLat) ||
+                coordsNear(eLon2, eLat2, endLon, endLat);
+
+            if (sharesEndpoint)
+                return false;
+
+            auto pointOnEdgeFast = [&](double pLon, double pLat) {
+                if (pLon < edgeMinLon - COORD_TOL || pLon > edgeMaxLon + COORD_TOL ||
+                    pLat < edgeMinLat - COORD_TOL || pLat > edgeMaxLat + COORD_TOL)
+                    return false;
+
+                double dx = eLon2 - eLon1;
+                double dy = eLat2 - eLat1;
+                double dpx = pLon - eLon1;
+                double dpy = pLat - eLat1;
+                double cross = dx * dpy - dy * dpx;
+                double lenSq = dx * dx + dy * dy;
+                return (cross * cross) < (COORD_TOL * COORD_TOL * lenSq * 100.0);
+            };
+
+            if (pointOnEdgeFast(startLon, startLat) ||
+                pointOnEdgeFast(endLon, endLat))
+                return false;
+
+            GSegment edgeSeg(eLon1, eLat1, eLon2, eLat2);
+            return seg.intersects(edgeSeg, false);
+        });
+    if (blocked)
+        return false;
 
     return true;
 }
