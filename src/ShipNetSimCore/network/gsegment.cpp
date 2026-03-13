@@ -213,15 +213,16 @@ void GSegment::boundingBox(double& minLon, double& minLat,
 // Haversine Length
 // =============================================================================
 
-double GSegment::approxLengthMeters() const
+double GSegment::haversineRaw(double lon1, double lat1,
+                              double lon2, double lat2)
 {
     constexpr double DEG_TO_RAD = M_PI / 180.0;
     constexpr double EARTH_RADIUS = 6371000.0;
 
-    double lat1r = mLat1 * DEG_TO_RAD;
-    double lat2r = mLat2 * DEG_TO_RAD;
+    double lat1r = lat1 * DEG_TO_RAD;
+    double lat2r = lat2 * DEG_TO_RAD;
     double dLat = lat2r - lat1r;
-    double dLon = (mLon2 - mLon1) * DEG_TO_RAD;
+    double dLon = (lon2 - lon1) * DEG_TO_RAD;
 
     // Wrap dLon for antimeridian
     if (dLon > M_PI)  dLon -= 2.0 * M_PI;
@@ -232,6 +233,11 @@ double GSegment::approxLengthMeters() const
                std::sin(dLon * 0.5) * std::sin(dLon * 0.5);
 
     return EARTH_RADIUS * 2.0 * std::asin(std::sqrt(a));
+}
+
+double GSegment::approxLengthMeters() const
+{
+    return haversineRaw(mLon1, mLat1, mLon2, mLat2);
 }
 
 // =============================================================================

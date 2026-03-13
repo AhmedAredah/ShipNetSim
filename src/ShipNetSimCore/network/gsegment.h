@@ -151,6 +151,14 @@ public:
      */
     bool crossesAntimeridian() const;
 
+    /**
+     * @brief Haversine distance between two lon/lat points in meters.
+     *
+     * No heap allocation, no GPoint construction. Pure arithmetic.
+     */
+    static double haversineRaw(double lon1, double lat1,
+                               double lon2, double lat2);
+
 private:
     double mLon1, mLat1, mLon2, mLat2;  // 32 bytes total
 
