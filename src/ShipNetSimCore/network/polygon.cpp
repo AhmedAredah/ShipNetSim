@@ -1114,9 +1114,11 @@ std::shared_ptr<Polygon> Polygon::simplify(double toleranceMeters) const
     constexpr double METERS_PER_DEGREE = 111000.0;
     double toleranceDegrees = toleranceMeters / METERS_PER_DEGREE;
 
-    // Use GDAL's Simplify which implements Douglas-Peucker
+    // Use GDAL's SimplifyPreserveTopology (GEOS TopologyPreservingSimplifier)
+    // instead of Simplify (Douglas-Peucker) which can produce invalid geometry
+    // (self-intersecting rings), causing fallback to original polygon.
     std::unique_ptr<OGRGeometry> simplified(
-        mPolygon.Simplify(toleranceDegrees));
+        mPolygon.SimplifyPreserveTopology(toleranceDegrees));
 
     if (!simplified || simplified->getGeometryType() != wkbPolygon)
     {

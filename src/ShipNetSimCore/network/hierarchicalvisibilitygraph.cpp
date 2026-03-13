@@ -484,6 +484,22 @@ ShortestPathResult HierarchicalVisibilityGraph::aStarAtLevel(
     gScore[startIdx] = 0.0;
     openSet.push({heuristic(startNav), startIdx});
 
+    // Pre-connect goal to the graph — mirrors how
+    // precomputeCorridorAdjacency adds goal as a vertex.
+    // Skip when corridor already has goal with full adjacency.
+    std::unordered_set<int> goalReachableFrom;
+    bool goalInCorridorAdj = corridor && corridor->hasAdjacency
+        && corridor->vertexIndex.count(endNav) > 0;
+    if (!goalInCorridorAdj)
+    {
+        auto goalNeighbors = getVisibleNodesForPoint(endNav, level, corridor);
+        for (const auto& gn : goalNeighbors) {
+            int gnIdx = getOrAddIndex(gn);
+            ensureCapacity(gnIdx);
+            goalReachableFrom.insert(gnIdx);
+        }
+    }
+
     QElapsedTimer progressTimer;
     progressTimer.start();
     qint64 lastProgressEmit = 0;
@@ -522,11 +538,8 @@ ShortestPathResult HierarchicalVisibilityGraph::aStarAtLevel(
         // Get neighbors
         auto neighbors = getVisibleNodesForPoint(current, level, corridor);
 
-        // Check direct visibility to goal only when reasonably close.
-        double distToGoal = heuristic(current);
-        if (currentIdx != endIdx && !closed[endIdx]
-            && distToGoal < 50000.0  // 50km threshold
-            && isVisible(current, endNav, level))
+        // If current vertex can reach the goal (pre-computed), add as neighbor
+        if (!closed[endIdx] && goalReachableFrom.count(currentIdx))
         {
             neighbors.append(endNav);
         }
@@ -2129,6 +2142,19 @@ ShortestPathResult HierarchicalVisibilityGraph::findShortestPath(
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal)
 {
+    // Direct visibility check — mirrors the shortcut in
+    // findShortestPathHelper (multi-waypoint API).
+    // If start and goal can see each other directly, skip hierarchical search.
+    if (start && goal && !(*start == *goal)) {
+        auto directLine = std::make_shared<GLine>(start, goal);
+        if (isSegmentVisible(directLine, 0)) {
+            ShortestPathResult result;
+            result.points.append(start);
+            result.points.append(goal);
+            result.lines.append(directLine);
+            return result;
+        }
+    }
     return hierarchicalSearch(start, goal);
 }
 
