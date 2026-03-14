@@ -53,6 +53,11 @@ private slots:
     void testSymmetry_Rotterdam_NY();
     void testSymmetry_Singapore_Busan();
 
+    // Diagnostic tests — investigate WHY tests fail at a given resolution
+    void testDiag_PointContainment();
+    void testDiag_FailingRouteDetails();
+    void testDiag_ExportGeoJSON();
+
 private:
     std::shared_ptr<GPoint> makePoint(double lon, double lat,
                                       const QString &id);
@@ -232,12 +237,12 @@ void RealWorldShortestPathTest::runRouteTest(
 void RealWorldShortestPathTest::initTestCase()
 {
     QString dataPath =
-        QCoreApplication::applicationDirPath() + "/data/ne_10m_ocean.shp";
+        QCoreApplication::applicationDirPath() + "/data/ne_110m_ocean.shp";
 
     if (!QFile::exists(dataPath)) {
         qWarning() << "Ocean data not found at:" << dataPath;
         mDataAvailable = false;
-        QSKIP("Real-world ocean data (ne_10m_ocean.shp) not available");
+        QSKIP("Real-world ocean data (ne_110m_ocean.shp) not available");
         return;
     }
 
@@ -542,6 +547,264 @@ void RealWorldShortestPathTest::testSymmetry_Singapore_Busan()
                  QString("Symmetry violation: SG->B=%1km, B->SG=%2km, "
                          "ratio=%3")
                      .arg(fwdKm).arg(revKm).arg(ratio)));
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic Tests — investigate WHY tests fail at a given resolution
+// ---------------------------------------------------------------------------
+
+void RealWorldShortestPathTest::testDiag_PointContainment()
+{
+    skipIfNoData();
+
+    auto hvg = mNetwork->getVisibilityGraph();
+    QVERIFY(hvg);
+
+    // Points that fail on 110m (and potentially others)
+    struct TestPort {
+        const char *name;
+        double lon, lat;
+    };
+    TestPort ports[] = {
+        {"Antwerpen",  4.40,   51.22},
+        {"Zeebrugge",  3.20,   51.33},
+        {"NewYork",   -74.01,  40.71},
+        {"Boston",    -71.06,  42.36},
+        {"Yokohama",  139.64,  35.44},
+        {"LongBeach", -118.19, 33.77},
+        {"Brisbane",  153.03, -27.47},
+        {"Newcastle", 151.78, -32.93},
+        {"Rotterdam",   4.48,  51.92},
+        {"Algeciras",  -5.45,  36.14},
+        {"Colon",     -79.91,   9.35},
+        {"Dover",       1.30,  51.10},
+        {"Calais",      1.85,  50.95},
+    };
+
+    qWarning() << "=== POINT CONTAINMENT DIAGNOSTIC ===";
+    qWarning() << "Dataset polygons:" << hvg->polygons.size();
+    for (const auto &poly : hvg->polygons) {
+        qWarning() << "  Polygon: outer=" << poly->outer().size()
+                    << "vertices, holes=" << poly->inners().size();
+    }
+
+    for (const auto &port : ports) {
+        auto pt = makePoint(port.lon, port.lat, port.name);
+
+        // Check containment in each polygon
+        bool inAnyPoly = false;
+        int holeIdx = -1;
+        for (int pi = 0; pi < hvg->polygons.size(); ++pi) {
+            const auto &poly = hvg->polygons[pi];
+            bool inExterior = poly->isPointWithinExteriorRing(*pt);
+            int hole = poly->findContainingHoleIndex(*pt);
+            bool inPoly = poly->isPointWithinPolygon(*pt);
+
+            if (inExterior || hole >= 0 || inPoly) {
+                qWarning() << "  " << port.name
+                           << "poly" << pi
+                           << ": inExterior=" << inExterior
+                           << "holeIdx=" << hole
+                           << "inPolygon=" << inPoly;
+            }
+            if (inPoly) inAnyPoly = true;
+            if (hole >= 0) holeIdx = hole;
+        }
+
+        // Find nearest vertex across all polygons
+        double minDistKm = std::numeric_limits<double>::max();
+        for (const auto &poly : hvg->polygons) {
+            for (const auto &v : poly->outer()) {
+                double d = pt->fastDistance(*v).value() / 1000.0;
+                if (d < minDistKm) minDistKm = d;
+            }
+            for (const auto &hole : poly->inners()) {
+                for (const auto &v : hole) {
+                    double d = pt->fastDistance(*v).value() / 1000.0;
+                    if (d < minDistKm) minDistKm = d;
+                }
+            }
+        }
+
+        qWarning() << "  " << port.name
+                   << QString("(%1,%2)").arg(port.lon).arg(port.lat)
+                   << ": inWater=" << inAnyPoly
+                   << "onLand(hole)=" << holeIdx
+                   << "nearestVertex=" << QString::number(minDistKm, 'f', 1) << "km";
+    }
+}
+
+void RealWorldShortestPathTest::testDiag_FailingRouteDetails()
+{
+    skipIfNoData();
+
+    struct Route {
+        const char *name;
+        double sLon, sLat, eLon, eLat;
+    };
+    Route routes[] = {
+        {"Antwerpen-Zeebrugge",   4.40, 51.22,   3.20, 51.33},
+        {"NY-Boston",            -74.01, 40.71, -71.06, 42.36},
+        {"Brisbane-Newcastle",   153.03,-27.47, 151.78,-32.93},
+        {"Rotterdam-Algeciras",    4.48, 51.92,  -5.45, 36.14},
+        {"NY-Colon",             -74.01, 40.71, -79.91,  9.35},
+        {"Rotterdam-NY",           4.48, 51.92, -74.01, 40.71},
+        {"Yokohama-LongBeach",   139.64, 35.44,-118.19, 33.77},
+        {"Dover-Calais",           1.30, 51.10,   1.85, 50.95},
+    };
+
+    qWarning() << "\n=== FAILING ROUTE DIAGNOSTIC ===";
+
+    for (const auto &r : routes) {
+        auto start = makePoint(r.sLon, r.sLat, "S");
+        auto goal = makePoint(r.eLon, r.eLat, "G");
+
+        // Great-circle distance
+        double gcKm = start->distance(*goal).value() / 1000.0;
+
+        QElapsedTimer timer;
+        timer.start();
+        auto result = mNetwork->findShortestPath(
+            start, goal, PathFindingAlgorithm::AStar);
+        qint64 ms = timer.elapsed();
+
+        if (!result.isValid()) {
+            qWarning() << "  " << r.name
+                       << ": INVALID (no path found)"
+                       << "GC=" << QString::number(gcKm, 'f', 0) << "km"
+                       << "time=" << ms << "ms";
+            continue;
+        }
+
+        double totalKm = computeTotalPathLengthKm(result);
+        double ratio = totalKm / gcKm;
+        bool continuous = verifyPathContinuity(result);
+
+        double startSnapKm =
+            result.points.first()->distance(*start).value() / 1000.0;
+        double endSnapKm =
+            result.points.last()->distance(*goal).value() / 1000.0;
+
+        qWarning() << "  " << r.name
+                   << ": path=" << QString::number(totalKm, 'f', 0) << "km"
+                   << "GC=" << QString::number(gcKm, 'f', 0) << "km"
+                   << "ratio=" << QString::number(ratio, 'f', 2)
+                   << "snap(S)=" << QString::number(startSnapKm, 'f', 1) << "km"
+                   << "snap(G)=" << QString::number(endSnapKm, 'f', 1) << "km"
+                   << "continuous=" << continuous
+                   << "pts=" << result.points.size()
+                   << "time=" << ms << "ms";
+
+        // Log first and last path coordinates
+        if (result.points.size() >= 2) {
+            auto first = result.points.first();
+            auto last = result.points.last();
+            qWarning() << "    start:"
+                       << first->getLongitude().value()
+                       << first->getLatitude().value()
+                       << "  end:"
+                       << last->getLongitude().value()
+                       << last->getLatitude().value();
+        }
+    }
+}
+
+void RealWorldShortestPathTest::testDiag_ExportGeoJSON()
+{
+    skipIfNoData();
+
+    struct Route {
+        const char *name;
+        double sLon, sLat, eLon, eLat;
+    };
+    Route routes[] = {
+        {"Antwerpen-Zeebrugge",     4.40,  51.22,    3.20,  51.33},
+        {"Santos-Paranagua",       -46.31, -23.96,  -48.51, -25.50},
+        {"NY-Boston",              -74.01,  40.71,  -71.06,  42.36},
+        {"Brisbane-Newcastle",     153.03, -27.47,  151.78, -32.93},
+        {"Rotterdam-Algeciras",      4.48,  51.92,   -5.45,  36.14},
+        {"NY-Colon",               -74.01,  40.71,  -79.91,   9.35},
+        {"Colombo-Jeddah",          79.85,   6.93,   39.17,  21.49},
+        {"Singapore-Busan",        103.82,   1.35,  129.08,  35.18},
+        {"Rotterdam-NY",             4.48,  51.92,  -74.01,  40.71},
+        {"Santos-CapeTown",        -46.31, -23.96,   18.42, -33.92},
+        {"Singapore-PortSaid",     103.82,   1.35,   32.30,  31.26},
+        {"Yokohama-LongBeach",     139.64,  35.44, -118.19,  33.77},
+        {"Dover-Calais",             1.30,  51.10,    1.85,  50.95},
+        {"Malacca",                103.82,   1.35,  100.35,   5.42},
+        {"SuezApproach",            32.30,  31.26,   32.55,  29.97},
+    };
+
+    // Build GeoJSON FeatureCollection
+    QString geojson = "{\n  \"type\": \"FeatureCollection\",\n  \"features\": [\n";
+    bool firstFeature = true;
+
+    for (const auto &r : routes) {
+        auto start = makePoint(r.sLon, r.sLat, "S");
+        auto goal  = makePoint(r.eLon, r.eLat, "G");
+
+        auto result = mNetwork->findShortestPath(
+            start, goal, PathFindingAlgorithm::AStar);
+
+        // Origin marker
+        if (!firstFeature) geojson += ",\n";
+        firstFeature = false;
+        geojson += QString(
+            "    {\"type\":\"Feature\",\"properties\":"
+            "{\"name\":\"%1 (origin)\",\"marker-color\":\"#00ff00\"},"
+            "\"geometry\":{\"type\":\"Point\","
+            "\"coordinates\":[%2,%3]}}")
+            .arg(r.name).arg(r.sLon, 0, 'f', 6).arg(r.sLat, 0, 'f', 6);
+
+        // Destination marker
+        geojson += QString(
+            ",\n    {\"type\":\"Feature\",\"properties\":"
+            "{\"name\":\"%1 (dest)\",\"marker-color\":\"#ff0000\"},"
+            "\"geometry\":{\"type\":\"Point\","
+            "\"coordinates\":[%2,%3]}}")
+            .arg(r.name).arg(r.eLon, 0, 'f', 6).arg(r.eLat, 0, 'f', 6);
+
+        if (!result.isValid()) {
+            qWarning() << r.name << ": NO PATH (skipping line)";
+            continue;
+        }
+
+        double totalKm = computeTotalPathLengthKm(result);
+
+        // Path line
+        QString coords;
+        for (int i = 0; i < result.points.size(); ++i) {
+            if (i > 0) coords += ",";
+            coords += QString("[%1,%2]")
+                .arg(result.points[i]->getLongitude().value(), 0, 'f', 6)
+                .arg(result.points[i]->getLatitude().value(), 0, 'f', 6);
+        }
+
+        geojson += QString(
+            ",\n    {\"type\":\"Feature\",\"properties\":"
+            "{\"name\":\"%1\",\"length_km\":%2,\"points\":%3,"
+            "\"stroke\":\"#0066ff\",\"stroke-width\":2},"
+            "\"geometry\":{\"type\":\"LineString\","
+            "\"coordinates\":[%4]}}")
+            .arg(r.name)
+            .arg(totalKm, 0, 'f', 1)
+            .arg(result.points.size())
+            .arg(coords);
+    }
+
+    geojson += "\n  ]\n}\n";
+
+    // Write to file next to test binary
+    QString outPath = QCoreApplication::applicationDirPath()
+                      + "/diagnostic_paths.geojson";
+    QFile file(outPath);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        file.write(geojson.toUtf8());
+        file.close();
+        qWarning() << "GeoJSON written to:" << outPath;
+    } else {
+        qWarning() << "Failed to write GeoJSON to:" << outPath;
+    }
 }
 
 // Custom main: disable the default 5-minute per-function watchdog
