@@ -209,22 +209,36 @@ bool OuterRingSpatialIndex::containsPoint(double lon, double lat) const
     if (n < 3)
         return false;
 
-    // Ray-casting algorithm on cached coordinate arrays
-    int intersections = 0;
+    // OGR-compatible ray-casting using translated coordinates.
+    // Translating to the test point (comparing with 0) avoids
+    // catastrophic cancellation that occurs when comparing two
+    // large, nearly-equal values in the absolute-coordinate formula.
+    // See OGR's OGRLinearRing::isPointInRing() for reference.
+    int crossings = 0;
 
-    for (int i = 0, j = n - 1; i < n; j = i++)
+    double prevDx = mLons[0] - lon;
+    double prevDy = mLats[0] - lat;
+
+    for (int i = 1; i <= n; ++i)
     {
-        double xi = mLons[i], yi = mLats[i];
-        double xj = mLons[j], yj = mLats[j];
+        int    idx = i % n;
+        double x1  = mLons[idx] - lon;
+        double y1  = mLats[idx] - lat;
+        double x2  = prevDx;
+        double y2  = prevDy;
 
-        if (((yi > lat) != (yj > lat))
-            && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi))
+        if (((y1 > 0) && (y2 <= 0)) || ((y2 > 0) && (y1 <= 0)))
         {
-            intersections++;
+            double xIntersect = (x1 * y2 - x2 * y1) / (y2 - y1);
+            if (0.0 < xIntersect)
+                crossings++;
         }
+
+        prevDx = x1;
+        prevDy = y1;
     }
 
-    return (intersections % 2) == 1;
+    return (crossings % 2) == 1;
 }
 
 }  // namespace ShipNetSimCore

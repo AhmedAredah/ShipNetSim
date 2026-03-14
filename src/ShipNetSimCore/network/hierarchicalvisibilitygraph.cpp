@@ -1056,6 +1056,19 @@ bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
         auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
         if (!commonPolygon->isValidWaterSegment(segLine))
             return false;
+
+        // Verify midpoint is inside the water polygon — prevents
+        // segments that exit the polygon through concavities in the
+        // outer ring (e.g., crossing land between two coastal vertices
+        // where no polygon edges block the path).
+        double midLon = (startPt->getLongitude().value()
+                         + endPt->getLongitude().value()) / 2.0;
+        double midLat = (startPt->getLatitude().value()
+                         + endPt->getLatitude().value()) / 2.0;
+        GPoint midPoint{units::angle::degree_t{midLon},
+                        units::angle::degree_t{midLat}};
+        if (!commonPolygon->isPointWithinPolygon(midPoint))
+            return false;
     }
     else
     {
@@ -1176,20 +1189,15 @@ bool HierarchicalVisibilityGraph::isVisibleInSimplifiedPolygon(
     if (*v1 == *v2)
         return true;
 
-    double ax = v1->getLongitude().value();
-    double ay = v1->getLatitude().value();
-    double bx = v2->getLongitude().value();
-    double by = v2->getLatitude().value();
-
-    // Edge crossing check: uses OuterRingSpatialIndex (grid-accelerated,
-    // cached coordinates, O(k) instead of O(n))
-    const auto& outerIdx = simplifiedPolygon->outerRingIndex();
-    if (outerIdx.doesSegmentCross(ax, ay, bx, by))
+    // Edge crossing check (grid-accelerated, O(k) instead of O(n))
+    if (simplifiedPolygon->segmentCrossesOuterRing(v1, v2))
         return false;
 
     // Midpoint-in-polygon check
-    double midLon = (ax + bx) / 2.0;
-    double midLat = (ay + by) / 2.0;
+    double midLon = (v1->getLongitude().value() + v2->getLongitude().value())
+                    / 2.0;
+    double midLat = (v1->getLatitude().value() + v2->getLatitude().value())
+                    / 2.0;
     GPoint midPoint{units::angle::degree_t{midLon},
                     units::angle::degree_t{midLat}};
     if (!simplifiedPolygon->isPointWithinPolygon(midPoint))
@@ -1479,12 +1487,16 @@ ShortestPathResult HierarchicalVisibilityGraph::reconstructPath(
         if (lvl.quadtree)
             lineSegment = lvl.quadtree->findLineSegment(next, current);
 
-        if (lineSegment)
+        if (lineSegment
+            && *lineSegment->startPoint() == *next
+            && *lineSegment->endPoint() == *current)
         {
+            // Cached line matches expected direction (next → current)
             result.lines.append(lineSegment);
         }
         else
         {
+            // No cached line or wrong direction — create correct one
             result.lines.append(
                 std::make_shared<GLine>(next, current));
         }
