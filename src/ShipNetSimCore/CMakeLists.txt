@@ -23,6 +23,8 @@ add_library(${SHIPNETSIM_CORE_DLL_NAME} SHARED
   network/point.h network/point.cpp
   network/line.h network/line.cpp
   network/polygon.h network/polygon.cpp
+  network/holespatialindex.h network/holespatialindex.cpp
+  network/outerringspatialindex.h network/outerringspatialindex.cpp
   ship/ishippropeller.h ship/ishippropeller.cpp
   ship/shippropeller.h ship/shippropeller.cpp
   utils/utils.h utils/utils.cpp

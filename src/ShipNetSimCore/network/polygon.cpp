@@ -201,9 +201,12 @@ void Polygon::setOuterPoints(const QVector<std::shared_ptr<GPoint>> &newOuter)
     }
 
     validateRing(outerRing, "Outer boundary");
+
+    mHoleIndex.invalidate();
+    mOuterRingIndex.invalidate();
 }
 
-QVector<std::shared_ptr<GPoint>> Polygon::outer() const
+const QVector<std::shared_ptr<GPoint>>& Polygon::outer() const
 {
     return mOutterBoundary;
 }
@@ -241,9 +244,11 @@ void Polygon::setInnerHolesPoints(
 
         validateRing(holeRing, "Hole");
     }
+
+    mHoleIndex.invalidate();
 }
 
-QVector<QVector<std::shared_ptr<GPoint>>> Polygon::inners() const
+const QVector<QVector<std::shared_ptr<GPoint>>>& Polygon::inners() const
 {
     return mInnerHoles;
 }
@@ -322,6 +327,24 @@ bool Polygon::crossesAntimeridian() const
 // Point Containment Tests
 // =============================================================================
 
+void Polygon::ensureHoleIndex() const
+{
+    if (!mHoleIndex.isBuilt())
+        mHoleIndex.build(mPolygon);
+}
+
+void Polygon::ensureOuterRingIndex() const
+{
+    if (!mOuterRingIndex.isBuilt())
+        mOuterRingIndex.build(mOutterBoundary);
+}
+
+const OuterRingSpatialIndex& Polygon::outerRingIndex() const
+{
+    ensureOuterRingIndex();
+    return mOuterRingIndex;
+}
+
 bool Polygon::isPointWithinExteriorRing(const GPoint &pointToCheck) const
 {
     auto           r = mPolygon.getExteriorRing();
@@ -347,23 +370,21 @@ bool Polygon::isPointWithinInteriorRings(const GPoint &pointToCheck) const
 
 int Polygon::findContainingHoleIndex(const GPoint &pointToCheck) const
 {
-    const OGRPoint p = pointToCheck.getGDALPoint();
+    ensureHoleIndex();
 
-    for (int i = 0; i < mPolygon.getNumInteriorRings(); ++i)
-    {
-        auto r = mPolygon.getInteriorRing(i);
+    double lon = pointToCheck.getLongitude().value();
+    double lat = pointToCheck.getLatitude().value();
 
-        if (r->isPointOnRingBoundary(&p, TRUE))
+    int result = -1;
+    mHoleIndex.forEachCandidate(lon, lat, [&](int holeIdx) -> bool {
+        if (isPointInHoleByCoords(lon, lat, holeIdx))
         {
-            return i;
+            result = holeIdx;
+            return true;  // found, stop
         }
-        if (r->isPointInRing(&p, TRUE))
-        {
-            return i;
-        }
-    }
-
-    return -1;
+        return false;
+    });
+    return result;
 }
 
 bool Polygon::isPointWithinPolygon(const GPoint &pointToCheck) const
@@ -391,23 +412,35 @@ bool Polygon::isPointWithinPolygon(const GPoint &pointToCheck) const
 
         OGRPoint normPoint(normPointLon, pointLat);
 
-        // Lambda to check if point is in any normalized hole
+        // Lambda to check if point is in any normalized hole.
+        // Uses precomputed bboxes for latitude prefiltering.
         auto isInNormalizedHole = [this, normPointLon, pointLat]() -> bool {
-            OGRPoint np(normPointLon, pointLat);
+            ensureHoleIndex();
 
             for (int h = 0; h < mPolygon.getNumInteriorRings(); ++h)
             {
+                // Latitude-only bbox prefilter (longitude may be shifted
+                // for antimeridian, so only filter by latitude)
+                if (mHoleIndex.hasHoles())
+                {
+                    const auto &bbox = mHoleIndex.holeBBox(h);
+                    if (pointLat < bbox.MinY || pointLat > bbox.MaxY)
+                        continue;
+                }
+
                 auto         *hole = mPolygon.getInteriorRing(h);
                 OGRLinearRing normHole;
 
                 for (int i = 0; i < hole->getNumPoints(); ++i)
                 {
-                    double normLon = AngleUtils::normalizeLongitude360(hole->getX(i));
+                    double normLon =
+                        AngleUtils::normalizeLongitude360(hole->getX(i));
                     normHole.addPoint(normLon, hole->getY(i));
                 }
 
-                if (normHole.isPointOnRingBoundary(&np, TRUE) ||
-                    normHole.isPointInRing(&np, TRUE))
+                OGRPoint np(normPointLon, pointLat);
+                if (normHole.isPointOnRingBoundary(&np, TRUE)
+                    || normHole.isPointInRing(&np, TRUE))
                 {
                     return true;
                 }
@@ -435,7 +468,12 @@ bool Polygon::isPointWithinPolygon(const GPoint &pointToCheck) const
     {
         return false;
     }
-    return isPointWithinExteriorRing(pointToCheck);
+
+    // Use cached-coordinate ray-casting (faster than OGR API)
+    ensureOuterRingIndex();
+    return mOuterRingIndex.containsPoint(
+        pointToCheck.getLongitude().value(),
+        pointToCheck.getLatitude().value());
 }
 
 bool Polygon::ringsContain(std::shared_ptr<GPoint> point) const
@@ -449,16 +487,21 @@ bool Polygon::ringsContain(std::shared_ptr<GPoint> point) const
         return true;
     }
 
-    // Check interior ring boundaries
-    for (int i = 0; i < mPolygon.getNumInteriorRings(); ++i)
-    {
+    // Check interior ring boundaries using spatial index
+    ensureHoleIndex();
+    double lon = point->getLongitude().value();
+    double lat = point->getLatitude().value();
+
+    bool found = false;
+    mHoleIndex.forEachCandidate(lon, lat, [&](int i) -> bool {
         if (mPolygon.getInteriorRing(i)->isPointOnRingBoundary(&p, TRUE))
         {
+            found = true;
             return true;
         }
-    }
-
-    return false;
+        return false;
+    });
+    return found;
 }
 
 // =============================================================================
@@ -672,49 +715,30 @@ bool Polygon::segmentCrossesHoles(const std::shared_ptr<GLine> &segment) const
 bool Polygon::isSegmentDiagonalThroughHole(
     const std::shared_ptr<GLine> &segment) const
 {
-    int numHoles = mPolygon.getNumInteriorRings();
+    ensureHoleIndex();
+    if (!mHoleIndex.hasHoles())
+        return false;
 
     // Pre-compute segment bounding box
-    double segStartLon = segment->startPoint()->getLongitude().value();
-    double segEndLon   = segment->endPoint()->getLongitude().value();
-    double segStartLat = segment->startPoint()->getLatitude().value();
-    double segEndLat   = segment->endPoint()->getLatitude().value();
-    double segMinLon   = std::min(segStartLon, segEndLon);
-    double segMaxLon   = std::max(segStartLon, segEndLon);
-    double segMinLat   = std::min(segStartLat, segEndLat);
-    double segMaxLat   = std::max(segStartLat, segEndLat);
+    double segMinLon = std::min(
+        segment->startPoint()->getLongitude().value(),
+        segment->endPoint()->getLongitude().value());
+    double segMaxLon = std::max(
+        segment->startPoint()->getLongitude().value(),
+        segment->endPoint()->getLongitude().value());
+    double segMinLat = std::min(
+        segment->startPoint()->getLatitude().value(),
+        segment->endPoint()->getLatitude().value());
+    double segMaxLat = std::max(
+        segment->startPoint()->getLatitude().value(),
+        segment->endPoint()->getLatitude().value());
 
-    for (int holeIndex = 0; holeIndex < numHoles; ++holeIndex)
-    {
-        const OGRLinearRing *hole = mPolygon.getInteriorRing(holeIndex);
-        if (!hole)
-        {
-            continue;
-        }
-
-        // Quick bounding box check
-        OGREnvelope holeEnv;
-        hole->getEnvelope(&holeEnv);
-
-        if (segMaxLon < holeEnv.MinX || segMinLon > holeEnv.MaxX ||
-            segMaxLat < holeEnv.MinY || segMinLat > holeEnv.MaxY)
-        {
-            continue;  // No possible intersection
-        }
-
-        // Detailed checks
-        if (isSegmentPassingThroughHole(segment, holeIndex))
-        {
-            return true;
-        }
-
-        if (isSegmentCrossingHoleBoundary(segment, holeIndex))
-        {
-            return true;
-        }
-    }
-
-    return false;
+    return mHoleIndex.forEachCandidateInBBox(
+        segMinLon, segMaxLon, segMinLat, segMaxLat,
+        [&](int holeIndex) -> bool {
+            return isSegmentPassingThroughHole(segment, holeIndex)
+                   || isSegmentCrossingHoleBoundary(segment, holeIndex);
+        });
 }
 
 bool Polygon::isSegmentPassingThroughHole(
@@ -1179,7 +1203,7 @@ std::shared_ptr<Polygon> Polygon::simplify(double toleranceMeters) const
             }
         }
 
-        if (!holePoints.isEmpty())
+        if (holePoints.size() >= 3)
         {
             newHoles.append(holePoints);
         }

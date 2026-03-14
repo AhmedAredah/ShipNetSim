@@ -31,6 +31,8 @@
 #include "gline.h"
 #include "gpoint.h"
 #include "gsegment.h"
+#include "holespatialindex.h"
+#include "outerringspatialindex.h"
 #include "ogr_spatialref.h"
 #include <QVector>
 #include <memory>
@@ -72,6 +74,14 @@ private:
 
     /// Cache for antimeridian crossing status (-1=unchecked, 0=no, 1=yes)
     mutable int mCrossesAntimeridianCache = -1;
+
+    /// Spatial index for fast interior ring (hole) queries.
+    /// Built lazily on first query via ensureHoleIndex().
+    mutable HoleSpatialIndex mHoleIndex;
+
+    /// Spatial index for fast outer ring edge and containment queries.
+    /// Built lazily on first query via ensureOuterRingIndex().
+    mutable OuterRingSpatialIndex mOuterRingIndex;
 
     // =========================================================================
     // Private Helper Methods
@@ -187,6 +197,12 @@ private:
      */
     bool crossesAntimeridian() const;
 
+    /** @brief Ensure hole spatial index is built (lazy initialization). */
+    void ensureHoleIndex() const;
+
+    /** @brief Ensure outer ring spatial index is built. */
+    void ensureOuterRingIndex() const;
+
     // =========================================================================
     // Constructors
     // =========================================================================
@@ -224,7 +240,7 @@ public:
      * @brief Get the outer boundary points.
      * @return QVector of shared pointers to the outer boundary points
      */
-    QVector<std::shared_ptr<GPoint>> outer() const;
+    const QVector<std::shared_ptr<GPoint>>& outer() const;
 
     /**
      * @brief Set the inner hole boundaries.
@@ -241,7 +257,7 @@ public:
      * @brief Get the inner hole boundaries.
      * @return QVector of QVectors, each containing points of one hole
      */
-    QVector<QVector<std::shared_ptr<GPoint>>> inners() const;
+    const QVector<QVector<std::shared_ptr<GPoint>>>& inners() const;
 
     // =========================================================================
     // Point Containment Tests
@@ -457,6 +473,12 @@ public:
      * @return Number of vertices in exterior ring
      */
     int outerVertexCount() const;
+
+    /**
+     * @brief Access the outer ring spatial index (builds lazily).
+     * @return Const reference to the OuterRingSpatialIndex
+     */
+    const OuterRingSpatialIndex& outerRingIndex() const;
 
     // =========================================================================
     // String Representation
