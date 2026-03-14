@@ -1176,53 +1176,16 @@ bool HierarchicalVisibilityGraph::isVisibleInSimplifiedPolygon(
     if (*v1 == *v2)
         return true;
 
-    const auto& outer = simplifiedPolygon->outer();
-    int n = outer.size();
-    if (n < 3)
-        return true;
-
     double ax = v1->getLongitude().value();
     double ay = v1->getLatitude().value();
     double bx = v2->getLongitude().value();
     double by = v2->getLatitude().value();
 
-    auto sign = [](double v) -> int {
-        if (v > 1e-12) return 1;
-        if (v < -1e-12) return -1;
-        return 0;
-    };
-
-    auto cross = [](double ox, double oy, double ax, double ay,
-                    double bx, double by) -> double {
-        return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-    };
-
-    for (int i = 0; i < n; ++i)
-    {
-        const auto& edgeStart = outer[i];
-        const auto& edgeEnd = outer[(i + 1) % n];
-
-        double cx = edgeStart->getLongitude().value();
-        double cy = edgeStart->getLatitude().value();
-        double dx = edgeEnd->getLongitude().value();
-        double dy = edgeEnd->getLatitude().value();
-
-        bool aIsEndpoint = (std::abs(ax - cx) < 1e-9 && std::abs(ay - cy) < 1e-9) ||
-                           (std::abs(ax - dx) < 1e-9 && std::abs(ay - dy) < 1e-9);
-        bool bIsEndpoint = (std::abs(bx - cx) < 1e-9 && std::abs(by - cy) < 1e-9) ||
-                           (std::abs(bx - dx) < 1e-9 && std::abs(by - dy) < 1e-9);
-
-        if (aIsEndpoint || bIsEndpoint)
-            continue;
-
-        int d1 = sign(cross(cx, cy, dx, dy, ax, ay));
-        int d2 = sign(cross(cx, cy, dx, dy, bx, by));
-        int d3 = sign(cross(ax, ay, bx, by, cx, cy));
-        int d4 = sign(cross(ax, ay, bx, by, dx, dy));
-
-        if (d1 != d2 && d3 != d4 && d1 != 0 && d2 != 0 && d3 != 0 && d4 != 0)
-            return false;
-    }
+    // Edge crossing check: uses OuterRingSpatialIndex (grid-accelerated,
+    // cached coordinates, O(k) instead of O(n))
+    const auto& outerIdx = simplifiedPolygon->outerRingIndex();
+    if (outerIdx.doesSegmentCross(ax, ay, bx, by))
+        return false;
 
     // Midpoint-in-polygon check
     double midLon = (ax + bx) / 2.0;
