@@ -345,6 +345,16 @@ const OuterRingSpatialIndex& Polygon::outerRingIndex() const
     return mOuterRingIndex;
 }
 
+bool Polygon::segmentCrossesOuterRing(
+    const std::shared_ptr<GPoint> &v1,
+    const std::shared_ptr<GPoint> &v2) const
+{
+    ensureOuterRingIndex();
+    return mOuterRingIndex.doesSegmentCross(
+        v1->getLongitude().value(), v1->getLatitude().value(),
+        v2->getLongitude().value(), v2->getLatitude().value());
+}
+
 bool Polygon::isPointWithinExteriorRing(const GPoint &pointToCheck) const
 {
     auto           r = mPolygon.getExteriorRing();
@@ -375,12 +385,22 @@ int Polygon::findContainingHoleIndex(const GPoint &pointToCheck) const
     double lon = pointToCheck.getLongitude().value();
     double lat = pointToCheck.getLatitude().value();
 
-    int result = -1;
+    int           result = -1;
+    const OGRPoint ogrPt(lon, lat);
+
     mHoleIndex.forEachCandidate(lon, lat, [&](int holeIdx) -> bool {
+        // Fast ray-casting check first
         if (isPointInHoleByCoords(lon, lat, holeIdx))
         {
             result = holeIdx;
-            return true;  // found, stop
+            return true;
+        }
+        // Fallback: OGR boundary check for points on ring edges/vertices
+        auto *ring = mPolygon.getInteriorRing(holeIdx);
+        if (ring && ring->isPointOnRingBoundary(&ogrPt, TRUE))
+        {
+            result = holeIdx;
+            return true;
         }
         return false;
     });
@@ -469,11 +489,15 @@ bool Polygon::isPointWithinPolygon(const GPoint &pointToCheck) const
         return false;
     }
 
-    // Use cached-coordinate ray-casting (faster than OGR API)
+    // Fast ray-casting on cached coordinates (OGR-compatible algorithm)
     ensureOuterRingIndex();
-    return mOuterRingIndex.containsPoint(
-        pointToCheck.getLongitude().value(),
-        pointToCheck.getLatitude().value());
+    double lon = pointToCheck.getLongitude().value();
+    double lat = pointToCheck.getLatitude().value();
+    if (mOuterRingIndex.containsPoint(lon, lat))
+        return true;
+
+    // Fallback: OGR boundary check for points on ring edges/vertices
+    return isPointWithinExteriorRing(pointToCheck);
 }
 
 bool Polygon::ringsContain(std::shared_ptr<GPoint> point) const
@@ -487,21 +511,14 @@ bool Polygon::ringsContain(std::shared_ptr<GPoint> point) const
         return true;
     }
 
-    // Check interior ring boundaries using spatial index
-    ensureHoleIndex();
-    double lon = point->getLongitude().value();
-    double lat = point->getLatitude().value();
-
-    bool found = false;
-    mHoleIndex.forEachCandidate(lon, lat, [&](int i) -> bool {
+    // Check ALL interior ring boundaries (not in hot path —
+    // correctness over performance for boundary membership checks)
+    for (int i = 0; i < mPolygon.getNumInteriorRings(); ++i)
+    {
         if (mPolygon.getInteriorRing(i)->isPointOnRingBoundary(&p, TRUE))
-        {
-            found = true;
             return true;
-        }
-        return false;
-    });
-    return found;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -934,29 +951,36 @@ bool Polygon::isPointInHoleByCoords(double lon, double lat,
         return false;
     }
 
-    // Ray casting algorithm - directly on OGR ring coordinates
-    // No GPoint allocation needed!
-    int    intersections = 0;
-    double px            = lon;
-    double py            = lat;
+    // OGR-compatible ray-casting using translated coordinates.
+    // Translating to the test point (comparing with 0) avoids
+    // catastrophic cancellation that occurs when comparing two
+    // large, nearly-equal values in the absolute-coordinate formula.
+    // See OGR's OGRLinearRing::isPointInRing() for reference.
+    int crossings = 0;
+
+    double prevDx = hole->getX(0) - lon;
+    double prevDy = hole->getY(0) - lat;
 
     // Iterate through edges (numPoints - 1 because last point duplicates first)
-    for (int i = 0; i < numPoints - 1; ++i)
+    for (int i = 1; i < numPoints; ++i)
     {
-        double x1 = hole->getX(i);
-        double y1 = hole->getY(i);
-        double x2 = hole->getX(i + 1);
-        double y2 = hole->getY(i + 1);
+        double x1 = hole->getX(i) - lon;
+        double y1 = hole->getY(i) - lat;
+        double x2 = prevDx;
+        double y2 = prevDy;
 
-        // Check if ray from point crosses this edge
-        if (((y1 > py) != (y2 > py)) &&
-            (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1))
+        if (((y1 > 0) && (y2 <= 0)) || ((y2 > 0) && (y1 <= 0)))
         {
-            intersections++;
+            double xIntersect = (x1 * y2 - x2 * y1) / (y2 - y1);
+            if (0.0 < xIntersect)
+                crossings++;
         }
+
+        prevDx = x1;
+        prevDy = y1;
     }
 
-    return (intersections % 2) == 1;
+    return (crossings % 2) == 1;
 }
 
 bool Polygon::isPointInHole(const std::shared_ptr<GPoint> &point,

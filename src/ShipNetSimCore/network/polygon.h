@@ -203,6 +203,12 @@ private:
     /** @brief Ensure outer ring spatial index is built. */
     void ensureOuterRingIndex() const;
 
+    /**
+     * @brief Access the outer ring spatial index (private — use
+     *        segmentCrossesOuterRing() or isPointWithinPolygon() instead).
+     */
+    const OuterRingSpatialIndex& outerRingIndex() const;
+
     // =========================================================================
     // Constructors
     // =========================================================================
@@ -475,10 +481,18 @@ public:
     int outerVertexCount() const;
 
     /**
-     * @brief Access the outer ring spatial index (builds lazily).
-     * @return Const reference to the OuterRingSpatialIndex
+     * @brief Test if a segment crosses any edge of the outer ring.
+     *
+     * Uses the grid-accelerated OuterRingSpatialIndex for O(k) spatial
+     * filtering, then cross-product intersection test on candidate edges.
+     *
+     * @param v1 Segment start point
+     * @param v2 Segment end point
+     * @return true if the segment crosses any outer ring edge
      */
-    const OuterRingSpatialIndex& outerRingIndex() const;
+    bool segmentCrossesOuterRing(
+        const std::shared_ptr<GPoint> &v1,
+        const std::shared_ptr<GPoint> &v2) const;
 
     // =========================================================================
     // String Representation
