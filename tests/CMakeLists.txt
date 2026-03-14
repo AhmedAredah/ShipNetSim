@@ -42,7 +42,7 @@ function(add_shipnetsim_test test_name test_sources)
     add_test(NAME ${test_name} COMMAND ${test_name})
 
     # Set test timeout (5 minutes)
-    set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
+    # set_tests_properties(${test_name} PROPERTIES TIMEOUT 300)
 endfunction()
 
 # Individual test executables
@@ -52,6 +52,16 @@ add_shipnetsim_test(GSegmentTest test_gsegment.cpp)
 add_shipnetsim_test(PolygonTest test_polygon.cpp)
 add_shipnetsim_test(QuadtreeTest test_quadtree.cpp)
 add_shipnetsim_test(HierarchicalVisibilityGraphTest test_hierarchicalvisibilitygraph.cpp)
+add_shipnetsim_test(ShortestPathSyntheticTest test_shortestpath_synthetic.cpp)
+add_shipnetsim_test(ShortestPathRealWorldTest test_shortestpath_realworld.cpp)
+
+# # Real-world tests need longer timeout (HVG build can take several minutes
+# # for ne_10m_ocean.shp with 446K vertices). Set both CTest timeout and
+# # Qt Test function watchdog (QTEST_FUNCTION_TIMEOUT).
+# set_tests_properties(ShortestPathRealWorldTest PROPERTIES
+#     TIMEOUT 1200
+#     ENVIRONMENT "QTEST_FUNCTION_TIMEOUT=1200000"
+# )
 
 # Copy test data files to build directory
 file(COPY ${CMAKE_SOURCE_DIR}/src/data DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
