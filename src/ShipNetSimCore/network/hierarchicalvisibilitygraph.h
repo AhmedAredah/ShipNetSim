@@ -26,6 +26,19 @@ struct ShortestPathResult
     bool isValid() const;
 };
 
+/**
+ * @struct RingRange
+ * @brief Describes a contiguous range of vertices belonging to one polygon ring.
+ *
+ * Populated during level construction to enable O(n) boundary edge
+ * identification without re-scanning polygon structures.
+ */
+struct RingRange
+{
+    int startIdx;   ///< First vertex index in GraphLevel::vertices (inclusive)
+    int count;      ///< Number of vertices in this ring
+};
+
 struct GraphLevel
 {
     int    levelIndex;
@@ -38,6 +51,32 @@ struct GraphLevel
         GPoint::Hash, GPoint::Equal> vertexIndex;
     std::vector<int> vertexPolygonId;
     mutable QReadWriteLock lock;
+
+    /// Ring layout metadata — one outer ring range per polygon
+    std::vector<RingRange> outerRings;
+    /// Ring layout metadata — hole ring ranges per polygon
+    std::vector<std::vector<RingRange>> holeRings;
+};
+
+/**
+ * @struct PolygonGraph
+ * @brief Coarse polygon-level routing graph for instant L3 pathfinding.
+ *
+ * Represents connectivity between polygons via representative vertices.
+ * With 2 ocean polygons this is trivial; scales for multi-polygon datasets.
+ */
+struct PolygonGraph
+{
+    struct Edge
+    {
+        int    targetPoly;
+        double distance;
+    };
+    /// adjacency[polyIdx] = list of edges to other polygons
+    std::vector<std::vector<Edge>> adjacency;
+    /// One representative vertex per polygon (nearest outer vertex to center)
+    std::vector<std::shared_ptr<GPoint>> representatives;
+    int numPolygons = 0;
 };
 
 struct Corridor
@@ -51,6 +90,17 @@ struct Corridor
     std::unordered_map<std::shared_ptr<GPoint>, int,
         GPoint::Hash, GPoint::Equal> vertexIndex;
     bool hasAdjacency = false;
+
+    /// Edges penalized by iterative path validation (+1e9 cost).
+    /// Key: edgeKey(u, v) where u, v are corridor vertex indices.
+    std::unordered_set<long long> penalizedEdges;
+
+    /** @brief Compute a unique symmetric key for an edge (u, v). */
+    static long long edgeKey(int u, int v)
+    {
+        return static_cast<long long>(std::min(u, v)) * 1000000LL
+               + std::max(u, v);
+    }
 
     bool containsPoint(double lon, double lat) const
     {
@@ -145,6 +195,7 @@ signals:
 
 private:
     std::array<GraphLevel, NUM_LEVELS> mLevels;
+    PolygonGraph mPolygonGraph;
 
     std::atomic<bool> mLevel0AdjReady{false};
     QString mLevel0CachePath;
@@ -154,9 +205,75 @@ private:
     static constexpr double PORTAL_ZONE_DEGREES = 30.0;
     static constexpr double PORTAL_LAT_TOLERANCE = 10.0;
 
+    // Per-level maximum distance for adjacency building (meters)
+    static constexpr double LEVEL_MAX_DISTANCE[NUM_LEVELS] = {
+        50000.0, 2000000.0, 5000000.0, 2000000.0
+    };
+    // Per-level cap on cross-polygon edges per vertex
+    static constexpr int LEVEL_MAX_CROSS_CHECKS[NUM_LEVELS] = {
+        10, 20, 30, 50
+    };
+
     void buildAllLevels();
     void buildLevel(int idx);
     void buildAdjacencyForLevel(int idx);
+
+    // -----------------------------------------------------------------
+    // Phase-based adjacency construction helpers
+    // -----------------------------------------------------------------
+
+    /** @brief Phase 1: Add consecutive ring edges — O(n), no visibility. */
+    void addBoundaryEdges(GraphLevel& level);
+
+    /** @brief Phase 2: Add spatial-grid edges — O(n×k), skip-vis for L1+. */
+    void addSpatialGridEdges(GraphLevel& level, int levelIdx,
+                             double maxDist);
+
+    /** @brief Phase 3: Add antimeridian bridging edges. */
+    void addAntimeridianEdges(GraphLevel& level, int levelIdx,
+                              double maxDist);
+
+    // -----------------------------------------------------------------
+    // Polygon graph (coarse L3 routing)
+    // -----------------------------------------------------------------
+
+    void buildPolygonGraph();
+
+    ShortestPathResult polygonGraphSearch(
+        const std::shared_ptr<GPoint>& start,
+        const std::shared_ptr<GPoint>& goal);
+
+    // -----------------------------------------------------------------
+    // On-demand visibility with distance limits
+    // -----------------------------------------------------------------
+
+    /**
+     * @brief Find nearest visible nodes with distance sorting and caps.
+     *
+     * Sorts candidates by fastDistance to @p node, checks at most
+     * @p maxCheck nearest, and stops after finding @p maxFound visible.
+     * Reusable by both within-polygon and between-polygon queries.
+     */
+    QVector<std::shared_ptr<GPoint>> findNearestVisibleNodes(
+        const std::shared_ptr<GPoint>& node,
+        QVector<std::shared_ptr<GPoint>>& candidates,
+        int level,
+        int maxCheck = 100,
+        int maxFound = 10);
+
+    /**
+     * @brief Inject a point into a GraphLevel as a first-class vertex.
+     *
+     * Ensures that an L0-snapped user point exists as a graph vertex
+     * at a coarse level, with adjacency to nearby ring vertices.
+     * Enables consistent corridor guidance across all levels.
+     *
+     * @param point The L0-snapped point to inject
+     * @param level The target GraphLevel index (1-3)
+     * @return The vertex index in the level, or -1 if injection failed
+     */
+    int injectPointIntoLevel(const std::shared_ptr<GPoint>& point,
+                             int level);
 
     /** @brief Core visibility implementation using GSegment for hot-path geometry. */
     bool isSegmentVisibleImpl(

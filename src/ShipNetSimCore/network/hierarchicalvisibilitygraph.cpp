@@ -4,6 +4,7 @@
 #include <QDataStream>
 #include <QElapsedTimer>
 #include <QFile>
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <queue>
@@ -83,6 +84,9 @@ void HierarchicalVisibilityGraph::buildAllLevels()
     // to the same objects, so all adjacency building is single-threaded.
     for (int i = 1; i < NUM_LEVELS; ++i)
         buildAdjacencyForLevel(i);
+
+    // Build polygon-level graph for instant L3 coarse routing
+    buildPolygonGraph();
 }
 
 void HierarchicalVisibilityGraph::buildLevel(int idx)
@@ -141,32 +145,59 @@ void HierarchicalVisibilityGraph::buildLevel(int idx)
     level.vertexPolygonId.reserve(estimatedVertices);
     level.vertexIndex.reserve(estimatedVertices);
 
-    // Collect all vertices
+    // Collect all vertices and track ring layout metadata
+    int numPolys = level.polygons.size();
+    level.outerRings.resize(numPolys);
+    level.holeRings.resize(numPolys);
+
     int vertexIdx = 0;
-    for (int pi = 0; pi < level.polygons.size(); ++pi)
+    for (int pi = 0; pi < numPolys; ++pi)
     {
         const auto& poly = level.polygons[pi];
         if (!poly) continue;
 
-        for (const auto& vertex : poly->outer())
+        // --- Outer ring ---
+        const auto& outer = poly->outer();
+        int outerCount = 0;
+        int outerStart = vertexIdx;
+        for (const auto& vertex : outer)
         {
             if (!vertex) continue;
             level.vertices.append(vertex);
             level.vertexIndex[vertex] = vertexIdx;
             level.vertexPolygonId.push_back(pi);
-            vertexIdx++;
-        }
 
-        for (const auto& hole : poly->inners())
+            // Set ownership on simplified vertices so isVisible()
+            // skips the expensive findAllContainingPolygons() fallback
+            if (idx > 0)
+                vertex->addOwningPolygon(level.polygons[pi]);
+
+            vertexIdx++;
+            outerCount++;
+        }
+        level.outerRings[pi] = {outerStart, outerCount};
+
+        // --- Hole rings ---
+        const auto& holes = poly->inners();
+        level.holeRings[pi].reserve(holes.size());
+        for (const auto& hole : holes)
         {
+            int holeStart = vertexIdx;
+            int holeCount = 0;
             for (const auto& vertex : hole)
             {
                 if (!vertex) continue;
                 level.vertices.append(vertex);
                 level.vertexIndex[vertex] = vertexIdx;
                 level.vertexPolygonId.push_back(pi);
+
+                if (idx > 0)
+                    vertex->addOwningPolygon(level.polygons[pi]);
+
                 vertexIdx++;
+                holeCount++;
             }
+            level.holeRings[pi].push_back({holeStart, holeCount});
         }
     }
 
@@ -194,96 +225,671 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
 
     if (n == 0) return;
 
-    qDebug() << "Building adjacency for level" << idx
-             << "with" << n << "vertices";
-
     QElapsedTimer timer;
     timer.start();
 
+    // Level 0: O(n²) full visibility — comprehensive adjacency for
+    // the AdjBuilder cache. No distance limit, enabling direct
+    // cross-ocean edges. Only called from buildLevel0Adjacency()
+    // (ShipNetSimAdjBuilder tool), never at runtime.
+    if (idx == 0)
+    {
+        qDebug() << "Building L0 adjacency (O(n²) full visibility)"
+                 << "with" << n << "vertices";
+
+        for (int i = 0; i < n; ++i)
+        {
+            for (int j = i + 1; j < n; ++j)
+            {
+                if (isVisible(level.vertices[i], level.vertices[j], 0))
+                {
+                    level.adjacency[i].push_back(j);
+                    level.adjacency[j].push_back(i);
+                }
+            }
+        }
+
+        long long totalEdges = 0;
+        for (const auto& adj : level.adjacency)
+            totalEdges += adj.size();
+        qDebug() << "L0 adjacency built in" << timer.elapsed() << "ms,"
+                 << totalEdges << "directed edges";
+        return;
+    }
+
+    // Levels 1-3: phased approach (fast, skip-vis for corridor guidance)
     double maxDist = LEVEL_MAX_DISTANCE[idx];
 
-    int completedVertices = 0;
-    qint64 lastProgressEmit = 0;
-    int progressInterval = std::max(1, n / 100);
+    qDebug() << "Building adjacency for level" << idx
+             << "with" << n << "vertices (phased, maxDist="
+             << maxDist / 1000.0 << "km)";
+
+    // Phase 1: boundary edges — O(n), no visibility check
+    addBoundaryEdges(level);
+    qDebug() << "  Phase 1 (boundary edges) done in"
+             << timer.elapsed() << "ms";
+
+    // Phase 2: spatial grid edges — O(n × k)
+    if (maxDist > 0.0)
+    {
+        addSpatialGridEdges(level, idx, maxDist);
+        qDebug() << "  Phase 2 (spatial grid) done in"
+                 << timer.elapsed() << "ms";
+    }
+
+    // Phase 3: antimeridian bridging edges
+    if (maxDist > 500000.0)
+    {
+        addAntimeridianEdges(level, idx, maxDist);
+        qDebug() << "  Phase 3 (antimeridian) done in"
+                 << timer.elapsed() << "ms";
+    }
+
+    // Count total edges
+    long long totalEdges = 0;
+    for (const auto& adj : level.adjacency)
+        totalEdges += adj.size();
+
+    qDebug() << "Adjacency for level" << idx << "built in"
+             << timer.elapsed() << "ms,"
+             << totalEdges << "directed edges";
+}
+
+// =============================================================================
+// Phase 1: Boundary Edges
+// =============================================================================
+
+void HierarchicalVisibilityGraph::addBoundaryEdges(GraphLevel& level)
+{
+    auto connectRing = [&](const RingRange& range) {
+        if (range.count < 2) return;
+        for (int r = 0; r < range.count; ++r)
+        {
+            int i = range.startIdx + r;
+            int j = range.startIdx + (r + 1) % range.count;
+            level.adjacency[i].push_back(j);
+            level.adjacency[j].push_back(i);
+        }
+    };
+
+    for (size_t pi = 0; pi < level.outerRings.size(); ++pi)
+    {
+        connectRing(level.outerRings[pi]);
+        for (const auto& hr : level.holeRings[pi])
+            connectRing(hr);
+    }
+}
+
+// =============================================================================
+// Phase 2: Spatial Grid Edges
+// =============================================================================
+
+void HierarchicalVisibilityGraph::addSpatialGridEdges(
+    GraphLevel& level, int levelIdx, double maxDist)
+{
+    int n = level.vertices.size();
+    if (n == 0) return;
+
+    // Pre-extract coordinates for fast access
+    std::vector<double> lons(n), lats(n);
+    double minLon = 180.0, maxLon = -180.0;
+    double minLat = 90.0,  maxLat = -90.0;
+    for (int i = 0; i < n; ++i)
+    {
+        lons[i] = level.vertices[i]->getLongitude().value();
+        lats[i] = level.vertices[i]->getLatitude().value();
+        minLon = std::min(minLon, lons[i]);
+        maxLon = std::max(maxLon, lons[i]);
+        minLat = std::min(minLat, lats[i]);
+        maxLat = std::max(maxLat, lats[i]);
+    }
+
+    // Build spatial grid
+    double cellSize = std::max(maxDist / (111000.0 * 10.0), 0.5);
+    int cols = std::max(1, static_cast<int>((maxLon - minLon) / cellSize) + 1);
+    int rows = std::max(1, static_cast<int>((maxLat - minLat) / cellSize) + 1);
+
+    // Clamp grid dimensions to prevent excessive memory
+    if (static_cast<long long>(cols) * rows > 10000000LL)
+    {
+        cellSize = std::sqrt((maxLon - minLon) * (maxLat - minLat)
+                             / 5000000.0);
+        cols = std::max(1,
+            static_cast<int>((maxLon - minLon) / cellSize) + 1);
+        rows = std::max(1,
+            static_cast<int>((maxLat - minLat) / cellSize) + 1);
+    }
+
+    std::vector<std::vector<int>> grid(
+        static_cast<size_t>(rows) * cols);
+    for (int i = 0; i < n; ++i)
+    {
+        int col = std::clamp(
+            static_cast<int>((lons[i] - minLon) / cellSize), 0, cols - 1);
+        int row = std::clamp(
+            static_cast<int>((lats[i] - minLat) / cellSize), 0, rows - 1);
+        grid[static_cast<size_t>(row) * cols + col].push_back(i);
+    }
+
+    int searchRadius = static_cast<int>(
+        std::ceil(maxDist / (111000.0 * cellSize))) + 1;
+    int maxCross = LEVEL_MAX_CROSS_CHECKS[levelIdx];
+
+    // Helper: compute octant index (0-7) for direction from vertex i to j
+    auto computeOctant = [](double dLon, double dLat) -> int {
+        // Map angle to 0-7: N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7
+        double angle = std::atan2(dLon, dLat);  // bearing-like (N=0)
+        if (angle < 0.0) angle += 2.0 * M_PI;
+        return static_cast<int>(angle / (M_PI / 4.0)) % 8;
+    };
+
+    // Duplicate-edge prevention set (avoids adding boundary edges again)
+    // Using a flat vector of sorted adjacency for fast lookup
+    std::vector<std::unordered_set<int>> existingEdges(n);
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j : level.adjacency[i])
+            existingEdges[i].insert(j);
+    }
+
+    auto addEdgeIfNew = [&](int i, int j) {
+        if (existingEdges[i].count(j) == 0)
+        {
+            level.adjacency[i].push_back(j);
+            level.adjacency[j].push_back(i);
+            existingEdges[i].insert(j);
+            existingEdges[j].insert(i);
+        }
+    };
 
     for (int i = 0; i < n; ++i)
     {
         int polyI = level.vertexPolygonId[i];
+        int col = std::clamp(
+            static_cast<int>((lons[i] - minLon) / cellSize), 0, cols - 1);
+        int row = std::clamp(
+            static_cast<int>((lats[i] - minLat) / cellSize), 0, rows - 1);
 
-        // Pre-cache vertex i coordinates for distance pre-filter
-        double lat1Rad = 0.0, cosLat1 = 1.0, lon1Deg = 0.0;
-        if (maxDist > 0.0)
+        // Track best cross-polygon candidate per target polygon
+        struct Candidate { int idx; double dist; };
+        std::unordered_map<int, Candidate> bestPerPoly;
+
+        // Track best same-polygon candidate per octant direction
+        std::array<Candidate, 8> octants;
+        for (auto& o : octants)
+            o = {-1, std::numeric_limits<double>::max()};
+
+        // Search nearby grid cells
+        for (int dr = -searchRadius; dr <= searchRadius; ++dr)
         {
-            lat1Rad = level.vertices[i]->getLatitude().value()
-                      * M_PI / 180.0;
-            lon1Deg = level.vertices[i]->getLongitude().value();
-            cosLat1 = std::cos(lat1Rad);
+            int r = row + dr;
+            if (r < 0 || r >= rows) continue;
+
+            for (int dc = -searchRadius; dc <= searchRadius; ++dc)
+            {
+                int c = col + dc;
+                if (c < 0 || c >= cols) continue;
+
+                for (int j : grid[static_cast<size_t>(r) * cols + c])
+                {
+                    if (j <= i) continue;  // each pair processed once
+
+                    // Haversine distance check
+                    double dist = GSegment::haversineRaw(
+                        lons[i], lats[i], lons[j], lats[j]);
+                    if (dist > maxDist) continue;
+
+                    int polyJ = level.vertexPolygonId[j];
+
+                    if (polyI != polyJ)
+                    {
+                        // Cross-polygon: keep nearest per target polygon
+                        auto it = bestPerPoly.find(polyJ);
+                        if (it == bestPerPoly.end()
+                            || dist < it->second.dist)
+                        {
+                            bestPerPoly[polyJ] = {j, dist};
+                        }
+                    }
+                    else if (levelIdx > 0)
+                    {
+                        // Same polygon, coarse level: nearest per octant
+                        double dLon = lons[j] - lons[i];
+                        double dLat = lats[j] - lats[i];
+                        int oct = computeOctant(dLon, dLat);
+                        if (dist < octants[oct].dist)
+                        {
+                            octants[oct] = {j, dist};
+                        }
+                    }
+                    // L0 same-polygon handled by O(n²) in buildAdjacencyForLevel
+                }
+            }
         }
 
-        for (int j = i + 1; j < n; ++j)
+        // Add cross-polygon edges (skip-vis — distance only for
+        // corridor guidance at coarse levels)
+        int crossCount = 0;
+        for (const auto& [polyJ, cand] : bestPerPoly)
         {
-            // Fast haversine distance pre-filter
-            if (maxDist > 0.0)
-            {
-                double lat2Rad =
-                    level.vertices[j]->getLatitude().value()
-                    * M_PI / 180.0;
-                double dLat = lat2Rad - lat1Rad;
-                double dLon =
-                    (level.vertices[j]->getLongitude().value()
-                     - lon1Deg) * M_PI / 180.0;
-                double a = std::sin(dLat / 2.0)
-                               * std::sin(dLat / 2.0) +
-                           cosLat1 * std::cos(lat2Rad)
-                               * std::sin(dLon / 2.0)
-                               * std::sin(dLon / 2.0);
-                if (6371000.0 * 2.0 * std::asin(std::sqrt(a))
-                    > maxDist)
-                    continue;
-            }
+            if (crossCount >= maxCross) break;
+            addEdgeIfNew(i, cand.idx);
+            crossCount++;
+        }
 
-            int polyJ = level.vertexPolygonId[j];
+        // Add same-polygon octant edges (coarse levels only, skip-vis)
+        for (const auto& oct : octants)
+        {
+            if (oct.idx < 0) continue;
+            addEdgeIfNew(i, oct.idx);
+        }
+    }
+}
 
-            bool visible = false;
+// =============================================================================
+// Phase 3: Antimeridian Edges
+// =============================================================================
 
-            if (polyI == polyJ && idx > 0)
-            {
-                // Same polygon at coarse levels: fast planar check
-                // (simplified polygons have reduced/no holes)
-                visible = isVisibleInSimplifiedPolygon(
-                    level.vertices[i], level.vertices[j],
-                    level.polygons[polyI]);
-            }
-            else
-            {
-                // Different polygons, or Level 0 same-polygon:
-                // full quadtree + hole visibility check
-                visible = isVisible(level.vertices[i],
-                                    level.vertices[j], idx);
-            }
+void HierarchicalVisibilityGraph::addAntimeridianEdges(
+    GraphLevel& level, int /*levelIdx*/, double maxDist)
+{
+    int n = level.vertices.size();
+    if (n == 0) return;
 
-            if (visible)
+    constexpr double ZONE = 30.0;  // degrees from antimeridian
+
+    // Collect east-side and west-side vertices
+    std::vector<int> eastSide, westSide;
+    for (int i = 0; i < n; ++i)
+    {
+        double lon = level.vertices[i]->getLongitude().value();
+        if (lon > 180.0 - ZONE) eastSide.push_back(i);
+        if (lon < -180.0 + ZONE) westSide.push_back(i);
+    }
+
+    if (eastSide.empty() || westSide.empty()) return;
+
+    // Duplicate-edge prevention
+    std::unordered_set<long long> addedEdges;
+    auto makeKey = [](int a, int b) -> long long {
+        return static_cast<long long>(std::min(a, b)) * 1000000LL
+               + std::max(a, b);
+    };
+
+    // For each east vertex, find nearest west vertices
+    for (int ei : eastSide)
+    {
+        double eLon = level.vertices[ei]->getLongitude().value();
+        double eLat = level.vertices[ei]->getLatitude().value();
+
+        struct Candidate { int idx; double dist; };
+        std::unordered_map<int, Candidate> bestPerPoly;
+
+        for (int wi : westSide)
+        {
+            // Wrap-around distance: treat as if west is east + 360
+            double wLon = level.vertices[wi]->getLongitude().value()
+                          + 360.0;
+            double dist = GSegment::haversineRaw(
+                eLon, eLat, wLon,
+                level.vertices[wi]->getLatitude().value());
+            if (dist > maxDist) continue;
+
+            int polyW = level.vertexPolygonId[wi];
+            auto it = bestPerPoly.find(polyW);
+            if (it == bestPerPoly.end() || dist < it->second.dist)
             {
-                // Write directly — no concurrent access
-                level.adjacency[i].push_back(j);
-                level.adjacency[j].push_back(i);
+                bestPerPoly[polyW] = {wi, dist};
             }
         }
 
-        ++completedVertices;
-        if (completedVertices % progressInterval == 0)
+        for (const auto& [polyW, cand] : bestPerPoly)
         {
-            qint64 nowMs = timer.elapsed();
-            if (nowMs - lastProgressEmit >= 1000)
+            long long key = makeKey(ei, cand.idx);
+            if (addedEdges.count(key)) continue;
+            addedEdges.insert(key);
+
+            level.adjacency[ei].push_back(cand.idx);
+            level.adjacency[cand.idx].push_back(ei);
+        }
+    }
+}
+
+// =============================================================================
+// Polygon Graph (L3 Coarse Routing)
+// =============================================================================
+
+void HierarchicalVisibilityGraph::buildPolygonGraph()
+{
+    const auto& lvl = mLevels[0];  // use L0 polygons for containment
+    int numPolys = lvl.polygons.size();
+
+    mPolygonGraph.numPolygons = numPolys;
+    mPolygonGraph.adjacency.clear();
+    mPolygonGraph.adjacency.resize(numPolys);
+    mPolygonGraph.representatives.clear();
+    mPolygonGraph.representatives.resize(numPolys);
+
+    if (numPolys == 0) return;
+
+    // Find representative vertex per polygon: nearest outer vertex
+    // to the polygon envelope center.
+    for (int pi = 0; pi < numPolys; ++pi)
+    {
+        const auto& poly = lvl.polygons[pi];
+        if (!poly) continue;
+
+        double envMinLon, envMaxLon, envMinLat, envMaxLat;
+        poly->getEnvelope(envMinLon, envMaxLon, envMinLat, envMaxLat);
+        double centerLon = (envMinLon + envMaxLon) / 2.0;
+        double centerLat = (envMinLat + envMaxLat) / 2.0;
+
+        double minDist = std::numeric_limits<double>::max();
+        for (const auto& v : poly->outer())
+        {
+            if (!v) continue;
+            double dist = GSegment::haversineRaw(
+                v->getLongitude().value(), v->getLatitude().value(),
+                centerLon, centerLat);
+            if (dist < minDist)
             {
-                lastProgressEmit = nowMs;
-                emit pathFindingProgress(-1, 0, nowMs / 1000.0);
+                minDist = dist;
+                mPolygonGraph.representatives[pi] = v;
             }
         }
     }
 
-    qDebug() << "Adjacency for level" << idx << "built in"
-             << timer.elapsed() << "ms";
+    // Connect all polygon pairs (with 2 polygons this is a single edge)
+    for (int pi = 0; pi < numPolys; ++pi)
+    {
+        if (!mPolygonGraph.representatives[pi]) continue;
+        for (int pj = pi + 1; pj < numPolys; ++pj)
+        {
+            if (!mPolygonGraph.representatives[pj]) continue;
+
+            double dist = mPolygonGraph.representatives[pi]
+                              ->fastDistance(
+                                  *mPolygonGraph.representatives[pj])
+                              .value();
+
+            mPolygonGraph.adjacency[pi].push_back({pj, dist});
+            mPolygonGraph.adjacency[pj].push_back({pi, dist});
+        }
+    }
+
+    qDebug() << "PolygonGraph built:" << numPolys << "polygons";
+}
+
+ShortestPathResult HierarchicalVisibilityGraph::polygonGraphSearch(
+    const std::shared_ptr<GPoint>& start,
+    const std::shared_ptr<GPoint>& goal)
+{
+    if (mPolygonGraph.numPolygons == 0)
+        return ShortestPathResult();
+
+    // Find containing polygons for start and goal
+    const auto& lvl = mLevels[0];
+    int startPolyIdx = -1, goalPolyIdx = -1;
+
+    for (int pi = 0; pi < mPolygonGraph.numPolygons; ++pi)
+    {
+        if (pi >= lvl.polygons.size() || !lvl.polygons[pi]) continue;
+
+        if (startPolyIdx < 0
+            && lvl.polygons[pi]->isPointWithinPolygon(*start))
+        {
+            startPolyIdx = pi;
+        }
+        if (goalPolyIdx < 0
+            && lvl.polygons[pi]->isPointWithinPolygon(*goal))
+        {
+            goalPolyIdx = pi;
+        }
+        if (startPolyIdx >= 0 && goalPolyIdx >= 0) break;
+    }
+
+    // If either point not in any polygon, try ringsContain fallback
+    if (startPolyIdx < 0 || goalPolyIdx < 0)
+    {
+        for (int pi = 0; pi < mPolygonGraph.numPolygons; ++pi)
+        {
+            if (pi >= lvl.polygons.size() || !lvl.polygons[pi]) continue;
+            if (startPolyIdx < 0
+                && lvl.polygons[pi]->ringsContain(
+                       std::const_pointer_cast<GPoint>(start)))
+            {
+                startPolyIdx = pi;
+            }
+            if (goalPolyIdx < 0
+                && lvl.polygons[pi]->ringsContain(
+                       std::const_pointer_cast<GPoint>(goal)))
+            {
+                goalPolyIdx = pi;
+            }
+        }
+    }
+
+    if (startPolyIdx < 0 || goalPolyIdx < 0)
+        return ShortestPathResult();  // fallback to aStarAtLevel
+
+    // Same polygon: return direct start→goal (no representative detour)
+    if (startPolyIdx == goalPolyIdx)
+    {
+        ShortestPathResult result;
+        result.points.append(start);
+        result.points.append(goal);
+        result.lines.append(
+            std::make_shared<GLine>(start, goal, FastConstruct));
+        return result;
+    }
+
+    // Different polygons: build path through representatives
+    // Simple A* on the polygon graph (typically just 2 polygons)
+    int numP = mPolygonGraph.numPolygons;
+    std::vector<double> gScore(numP,
+                               std::numeric_limits<double>::infinity());
+    std::vector<int> cameFrom(numP, -1);
+    std::vector<bool> closed(numP, false);
+
+    gScore[startPolyIdx] = 0.0;
+
+    using PQEntry = std::pair<double, int>;
+    std::priority_queue<PQEntry, std::vector<PQEntry>,
+                        std::greater<PQEntry>> openSet;
+    openSet.push({0.0, startPolyIdx});
+
+    while (!openSet.empty())
+    {
+        auto [fScore, current] = openSet.top();
+        openSet.pop();
+
+        if (closed[current]) continue;
+        closed[current] = true;
+
+        if (current == goalPolyIdx) break;
+
+        for (const auto& edge : mPolygonGraph.adjacency[current])
+        {
+            if (closed[edge.targetPoly]) continue;
+            double tentG = gScore[current] + edge.distance;
+            if (tentG < gScore[edge.targetPoly])
+            {
+                gScore[edge.targetPoly] = tentG;
+                cameFrom[edge.targetPoly] = current;
+                openSet.push({tentG, edge.targetPoly});
+            }
+        }
+    }
+
+    if (cameFrom[goalPolyIdx] == -1 && startPolyIdx != goalPolyIdx)
+        return ShortestPathResult();  // no path in polygon graph
+
+    // Reconstruct polygon path
+    std::vector<int> polyPath;
+    for (int p = goalPolyIdx; p != -1; p = cameFrom[p])
+        polyPath.push_back(p);
+    std::reverse(polyPath.begin(), polyPath.end());
+
+    // Build waypoint path: start → representatives → goal
+    ShortestPathResult result;
+    result.points.append(start);
+    for (size_t i = 0; i < polyPath.size(); ++i)
+    {
+        const auto& rep = mPolygonGraph.representatives[polyPath[i]];
+        if (rep && *rep != *start && *rep != *goal)
+        {
+            result.points.append(rep);
+        }
+    }
+    result.points.append(goal);
+
+    // Create line segments
+    for (int i = 0; i < result.points.size() - 1; ++i)
+    {
+        result.lines.append(std::make_shared<GLine>(
+            result.points[i], result.points[i + 1], FastConstruct));
+    }
+
+    return result;
+}
+
+// =============================================================================
+// Distance-Limited Visibility Helper
+// =============================================================================
+
+QVector<std::shared_ptr<GPoint>>
+HierarchicalVisibilityGraph::findNearestVisibleNodes(
+    const std::shared_ptr<GPoint>& node,
+    QVector<std::shared_ptr<GPoint>>& candidates,
+    int level,
+    int maxCheck,
+    int maxFound)
+{
+    int sortLimit = std::min(maxCheck,
+                             static_cast<int>(candidates.size()));
+    if (sortLimit <= 0)
+        return {};
+
+    // Partial sort: bring nearest sortLimit candidates to front
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + sortLimit,
+        candidates.end(),
+        [&node](const auto& a, const auto& b) {
+            return node->fastDistance(*a) < node->fastDistance(*b);
+        });
+
+    QVector<std::shared_ptr<GPoint>> visible;
+    visible.reserve(maxFound);
+
+    for (int i = 0; i < sortLimit
+                    && visible.size() < maxFound; ++i)
+    {
+        if (isVisible(node, candidates[i], level))
+            visible.append(candidates[i]);
+    }
+
+    return visible;
+}
+
+// =============================================================================
+// Vertex Injection into Coarse Levels
+// =============================================================================
+
+int HierarchicalVisibilityGraph::injectPointIntoLevel(
+    const std::shared_ptr<GPoint>& point, int level)
+{
+    if (!point || level < 0 || level >= NUM_LEVELS)
+        return -1;
+
+    auto& lvl = mLevels[level];
+
+    // Already present as a graph vertex — no injection needed
+    auto it = lvl.vertexIndex.find(point);
+    if (it != lvl.vertexIndex.end())
+        return it->second;
+
+    // Find the containing or nearest polygon at this level
+    int bestPolyIdx = -1;
+    double bestDist = std::numeric_limits<double>::max();
+
+    for (int pi = 0; pi < lvl.polygons.size(); ++pi)
+    {
+        const auto& poly = lvl.polygons[pi];
+        if (!poly) continue;
+
+        if (poly->isPointWithinPolygon(*point))
+        {
+            bestPolyIdx = pi;
+            break;
+        }
+
+        // Track nearest polygon by distance to outer ring vertices
+        for (const auto& v : poly->outer())
+        {
+            if (!v) continue;
+            double d = point->fastDistance(*v).value();
+            if (d < bestDist)
+            {
+                bestDist = d;
+                bestPolyIdx = pi;
+            }
+        }
+    }
+
+    if (bestPolyIdx < 0)
+        return -1;
+
+    // Add point to the level's vertex structures
+    int newIdx = lvl.vertices.size();
+    lvl.vertices.append(point);
+    lvl.vertexIndex[point] = newIdx;
+    lvl.vertexPolygonId.push_back(bestPolyIdx);
+
+    // Extend adjacency to accommodate the new vertex
+    lvl.adjacency.resize(newIdx + 1);
+
+    // Set polygon ownership for fast visibility lookups
+    point->addOwningPolygon(lvl.polygons[bestPolyIdx]);
+
+    // Connect to nearest vertices in the same polygon.
+    // This gives the injected point adjacency edges so A* can
+    // route through it, similar to Phase 2 spatial grid edges.
+    static constexpr int MAX_INJECT_NEIGHBORS = 8;
+
+    struct Candidate { int idx; double dist; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(256);
+
+    for (int vi = 0; vi < newIdx; ++vi)
+    {
+        if (lvl.vertexPolygonId[vi] != bestPolyIdx)
+            continue;
+        double d = point->fastDistance(*lvl.vertices[vi]).value();
+        candidates.push_back({vi, d});
+    }
+
+    if (candidates.empty())
+        return newIdx;
+
+    // Partial sort to find the nearest MAX_INJECT_NEIGHBORS
+    int limit = std::min(static_cast<int>(candidates.size()),
+                         MAX_INJECT_NEIGHBORS);
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + limit,
+        candidates.end(),
+        [](const Candidate& a, const Candidate& b) {
+            return a.dist < b.dist;
+        });
+
+    for (int i = 0; i < limit; ++i)
+    {
+        lvl.adjacency[newIdx].push_back(candidates[i].idx);
+        lvl.adjacency[candidates[i].idx].push_back(newIdx);
+    }
+
+    return newIdx;
 }
 
 // =============================================================================
@@ -558,8 +1164,27 @@ ShortestPathResult HierarchicalVisibilityGraph::aStarAtLevel(
             if (closed[neighborIdx])
                 continue;
 
-            double tentG = gScore[currentIdx]
-                           + current->fastDistance(*neighbor).value();
+            double edgeCost =
+                current->fastDistance(*neighbor).value();
+
+            // Apply penalty for edges flagged by iterative validation
+            if (corridor && !corridor->penalizedEdges.empty())
+            {
+                auto ci = corridor->vertexIndex.find(current);
+                auto ni = corridor->vertexIndex.find(neighbor);
+                if (ci != corridor->vertexIndex.end()
+                    && ni != corridor->vertexIndex.end())
+                {
+                    if (corridor->penalizedEdges.count(
+                            Corridor::edgeKey(ci->second,
+                                              ni->second)))
+                    {
+                        edgeCost += 1e9;
+                    }
+                }
+            }
+
+            double tentG = gScore[currentIdx] + edgeCost;
 
             if (tentG < gScore[neighborIdx])
             {
@@ -610,38 +1235,52 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     // Coarse results are NEVER returned — only used to guide Level 0.
     ShortestPathResult bestCoarseResult;
 
-    // Pre-snap points once per level to avoid redundant polygon scans
-    auto snapped3Start = snapToWater(start, 3);
-    auto snapped3Goal  = snapToWater(goal, 3);
+    // Snap ONCE at L0 (highest resolution, closest vertex match).
+    // Reuse these snapped points at ALL levels for consistency.
+    auto snappedStart = snapToWater(start, 0);
+    auto snappedGoal  = snapToWater(goal, 0);
 
-    // --- Level 3 (coarsest) ---
-    auto result3 = aStarAtLevel(start, goal, 3, nullptr,
-                                snapped3Start, snapped3Goal);
+    // Inject L0-snapped points into coarse levels (L1-L3) so they
+    // exist as first-class graph vertices with adjacency at every level.
+    // This ensures consistent corridor guidance regardless of
+    // simplification-induced vertex loss.
+    for (int lvl = 1; lvl < NUM_LEVELS; ++lvl)
+    {
+        if (snappedStart)
+            injectPointIntoLevel(snappedStart, lvl);
+        if (snappedGoal)
+            injectPointIntoLevel(snappedGoal, lvl);
+    }
+
+    // --- Level 3 (coarsest) — use polygon graph for instant routing ---
+    auto result3 = polygonGraphSearch(start, goal);
+
+    if (!result3.isValid())
+    {
+        // Polygon graph failed, try vertex-level L3 A*
+        result3 = aStarAtLevel(start, goal, 3, nullptr,
+                                snappedStart, snappedGoal);
+    }
 
     if (!result3.isValid())
     {
         qDebug() << "Level 3 failed, falling back to unconstrained level 0";
-        auto snapped0Start = snapToWater(start, 0);
-        auto snapped0Goal  = snapToWater(goal, 0);
         return aStarAtLevel(start, goal, 0, nullptr,
-                            snapped0Start, snapped0Goal);
+                            snappedStart, snappedGoal);
     }
     bestCoarseResult = result3;
 
     // --- Level 2 ---
-    auto snapped2Start = snapToWater(start, 2);
-    auto snapped2Goal  = snapToWater(goal, 2);
-
     double expansion2 = LEVEL_TOLERANCES[3] * 3.0;
     auto corridor2 = buildCorridor(result3, 2, expansion2);
     auto result2 = aStarAtLevel(start, goal, 2, &corridor2,
-                                snapped2Start, snapped2Goal);
+                                snappedStart, snappedGoal);
 
     if (!result2.isValid())
     {
         auto widerCorridor2 = buildCorridor(result3, 2, expansion2 * 3.0);
         result2 = aStarAtLevel(start, goal, 2, &widerCorridor2,
-                               snapped2Start, snapped2Goal);
+                               snappedStart, snappedGoal);
     }
 
     if (result2.isValid())
@@ -650,20 +1289,17 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     }
 
     // --- Level 1 ---
-    auto snapped1Start = snapToWater(start, 1);
-    auto snapped1Goal  = snapToWater(goal, 1);
-
     double expansion1 = LEVEL_TOLERANCES[2] * 3.0;
     auto corridor1 = buildCorridor(bestCoarseResult, 1, expansion1);
     auto result1 = aStarAtLevel(start, goal, 1, &corridor1,
-                                snapped1Start, snapped1Goal);
+                                snappedStart, snappedGoal);
 
     if (!result1.isValid())
     {
         auto widerCorridor1 = buildCorridor(bestCoarseResult, 1,
                                             expansion1 * 3.0);
         result1 = aStarAtLevel(start, goal, 1, &widerCorridor1,
-                               snapped1Start, snapped1Goal);
+                               snappedStart, snappedGoal);
     }
 
     if (result1.isValid())
@@ -672,9 +1308,6 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     }
 
     // --- Level 0 (original polygons — only valid final result) ---
-    // Pre-snap once for Level 0 — used across all corridor attempts
-    auto snapped0Start = snapToWater(start, 0);
-    auto snapped0Goal  = snapToWater(goal, 0);
 
     double expansion0 = LEVEL_TOLERANCES[1] * 3.0;
     bool hasLevel0Adj = mLevel0AdjReady.load(std::memory_order_acquire);
@@ -686,7 +1319,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
         // precomputeCorridorAdjacency needed.
         auto corridor0 = buildCorridor(bestCoarseResult, 0, expansion0);
         auto result0 = aStarAtLevel(start, goal, 0, &corridor0,
-                                    snapped0Start, snapped0Goal);
+                                    snappedStart, snappedGoal);
 
         if (result0.isValid())
             return result0;
@@ -694,7 +1327,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
         auto widerCorridor0 = buildCorridor(bestCoarseResult, 0,
                                             expansion0 * 3.0);
         result0 = aStarAtLevel(start, goal, 0, &widerCorridor0,
-                               snapped0Start, snapped0Goal);
+                               snappedStart, snappedGoal);
 
         if (result0.isValid())
             return result0;
@@ -702,18 +1335,70 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
         auto veryWideCorridor0 = buildCorridor(bestCoarseResult, 0,
                                                expansion0 * 10.0);
         result0 = aStarAtLevel(start, goal, 0, &veryWideCorridor0,
-                               snapped0Start, snapped0Goal);
+                               snappedStart, snappedGoal);
 
         if (result0.isValid())
             return result0;
     }
     else
     {
-        // Fallback: pre-compute corridor adjacency on-demand (old path)
+        // Pre-compute corridor adjacency with phased approach,
+        // then validate with penalty-based iterative pruning.
+        auto validateAndSearch =
+            [&](Corridor& corr) -> ShortestPathResult
+        {
+            ShortestPathResult bestResult;
+            int bestBadCount = std::numeric_limits<int>::max();
+
+            for (int iter = 0; iter < 20; ++iter)
+            {
+                auto result = aStarAtLevel(start, goal, 0, &corr,
+                                           snappedStart, snappedGoal);
+                if (!result.isValid()) break;
+
+                int prevSize = static_cast<int>(
+                    corr.penalizedEdges.size());
+                int badCount = 0;
+
+                for (int i = 0; i < result.lines.size(); ++i)
+                {
+                    // Skip short edges (coastline boundary tracing)
+                    if (result.lines[i]->length().value() < 2000.0)
+                        continue;
+
+                    if (!isSegmentVisible(result.lines[i], 0))
+                    {
+                        auto si = corr.vertexIndex.find(
+                            result.points[i]);
+                        auto ei = corr.vertexIndex.find(
+                            result.points[i + 1]);
+                        if (si != corr.vertexIndex.end()
+                            && ei != corr.vertexIndex.end())
+                        {
+                            corr.penalizedEdges.insert(
+                                Corridor::edgeKey(si->second,
+                                                  ei->second));
+                        }
+                        badCount++;
+                    }
+                }
+
+                if (badCount < bestBadCount)
+                {
+                    bestResult = result;
+                    bestBadCount = badCount;
+                }
+                if (badCount == 0) break;
+                if (static_cast<int>(corr.penalizedEdges.size())
+                    == prevSize)
+                    break;  // converged
+            }
+            return bestResult;
+        };
+
         auto corridor0 = buildCorridor(bestCoarseResult, 0, expansion0);
         precomputeCorridorAdjacency(corridor0, start, goal);
-        auto result0 = aStarAtLevel(start, goal, 0, &corridor0,
-                                    snapped0Start, snapped0Goal);
+        auto result0 = validateAndSearch(corridor0);
 
         if (result0.isValid())
             return result0;
@@ -722,8 +1407,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                                             expansion0 * 3.0);
         precomputeCorridorAdjacency(widerCorridor0, start, goal,
                                     &corridor0);
-        result0 = aStarAtLevel(start, goal, 0, &widerCorridor0,
-                               snapped0Start, snapped0Goal);
+        result0 = validateAndSearch(widerCorridor0);
 
         if (result0.isValid())
             return result0;
@@ -732,8 +1416,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                                                expansion0 * 10.0);
         precomputeCorridorAdjacency(veryWideCorridor0, start, goal,
                                     &widerCorridor0);
-        result0 = aStarAtLevel(start, goal, 0, &veryWideCorridor0,
-                               snapped0Start, snapped0Goal);
+        result0 = validateAndSearch(veryWideCorridor0);
 
         if (result0.isValid())
             return result0;
@@ -743,7 +1426,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     qDebug() << "All corridor attempts failed, "
                 "falling back to unconstrained level 0";
     return aStarAtLevel(start, goal, 0, nullptr,
-                        snapped0Start, snapped0Goal);
+                        snappedStart, snappedGoal);
 }
 
 // =============================================================================
@@ -782,8 +1465,25 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
         corridor.maxLat = std::max(corridor.maxLat, lat + latExpand);
     }
 
-    // Populate allowed vertex indices using quadtree range query
-    // instead of linear scan over all vertices — O(sqrt(n)) vs O(n).
+    // Use tube filtering only when coarse path has 3+ waypoints
+    // (curved route). For 2-point paths (direct line), the tube would
+    // be too narrow for routes that need to detour around land.
+    bool useTube = (coarsePath.points.size() >= 3);
+
+    std::vector<double> wpLons, wpLats;
+    if (useTube)
+    {
+        wpLons.reserve(coarsePath.points.size());
+        wpLats.reserve(coarsePath.points.size());
+        for (const auto& wp : coarsePath.points)
+        {
+            wpLons.push_back(wp->getLongitude().value());
+            wpLats.push_back(wp->getLatitude().value());
+        }
+    }
+
+    // Populate allowed vertex indices via quadtree range query,
+    // with optional per-waypoint tube filter for curved routes.
     const auto& lvl = mLevels[targetLevel];
     if (lvl.quadtree)
     {
@@ -795,23 +1495,54 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
         for (const auto& v : rangeVertices)
         {
             auto it = lvl.vertexIndex.find(v);
-            if (it != lvl.vertexIndex.end())
+            if (it == lvl.vertexIndex.end()) continue;
+
+            if (useTube)
             {
-                corridor.allowedVertexIndices.insert(it->second);
+                double vLon = v->getLongitude().value();
+                double vLat = v->getLatitude().value();
+                bool inTube = false;
+                for (size_t w = 0; w < wpLons.size() && !inTube; ++w)
+                {
+                    if (GSegment::haversineRaw(vLon, vLat,
+                                               wpLons[w], wpLats[w])
+                        <= expansion)
+                    {
+                        inTube = true;
+                    }
+                }
+                if (!inTube) continue;
             }
+
+            corridor.allowedVertexIndices.insert(it->second);
         }
     }
     else
     {
-        // Fallback to linear scan if quadtree unavailable
+        // Fallback to linear scan
         for (int i = 0; i < lvl.vertices.size(); ++i)
         {
-            double lon = lvl.vertices[i]->getLongitude().value();
-            double lat = lvl.vertices[i]->getLatitude().value();
-            if (corridor.containsPoint(lon, lat))
+            double vLon = lvl.vertices[i]->getLongitude().value();
+            double vLat = lvl.vertices[i]->getLatitude().value();
+
+            if (!corridor.containsPoint(vLon, vLat)) continue;
+
+            if (useTube)
             {
-                corridor.allowedVertexIndices.insert(i);
+                bool inTube = false;
+                for (size_t w = 0; w < wpLons.size() && !inTube; ++w)
+                {
+                    if (GSegment::haversineRaw(vLon, vLat,
+                                               wpLons[w], wpLats[w])
+                        <= expansion)
+                    {
+                        inTube = true;
+                    }
+                }
+                if (!inTube) continue;
             }
+
+            corridor.allowedVertexIndices.insert(i);
         }
     }
 
@@ -1385,13 +2116,9 @@ HierarchicalVisibilityGraph::getVisibleNodesWithinPolygon(
                      [&node](const auto& p) { return *p != *node; });
     }
 
-    QVector<std::shared_ptr<GPoint>> visibleNodes;
-    visibleNodes.reserve(candidates.size());
-    for (const auto& point : candidates)
-    {
-        if (isVisible(node, point, 0))
-            visibleNodes.append(point);
-    }
+    // Distance-sorted visibility with caps: check 500 nearest, stop at 20
+    auto visibleNodes = findNearestVisibleNodes(node, candidates, 0,
+                                                500, 20);
 
     // Add manual connections
     {
@@ -1444,13 +2171,8 @@ HierarchicalVisibilityGraph::getVisibleNodesBetweenPolygons(
         }
     }
 
-    QVector<std::shared_ptr<GPoint>> visibleNodes;
-    visibleNodes.reserve(tasks.size());
-    for (const auto& point : tasks)
-    {
-        if (isVisible(node, point, 0))
-            visibleNodes.append(point);
-    }
+    // Distance-sorted visibility with caps: check 100 nearest, stop at 10
+    auto visibleNodes = findNearestVisibleNodes(node, tasks, 0, 500, 20);
 
     QReadLocker locker(&mManualLock);
     auto it = manualConnections.find(node);
@@ -1800,11 +2522,11 @@ void HierarchicalVisibilityGraph::clear()
 {
     mLevel0AdjReady.store(false, std::memory_order_release);
 
-    // Clear vertex ownership and visibility cache
-    for (const auto& polygon : polygons)
+    // Clear vertex ownership and visibility cache for ALL levels
+    // (includes simplified vertices at L1-L3 that have ownership set)
+    for (int i = 0; i < NUM_LEVELS; ++i)
     {
-        if (!polygon) continue;
-        for (const auto& vertex : polygon->outer())
+        for (const auto& vertex : mLevels[i].vertices)
         {
             if (vertex)
             {
@@ -1812,19 +2534,13 @@ void HierarchicalVisibilityGraph::clear()
                 vertex->clearVisibleNeighborsCache();
             }
         }
-        for (const auto& hole : polygon->inners())
-        {
-            for (const auto& vertex : hole)
-            {
-                if (vertex)
-                {
-                    vertex->clearOwningPolygons();
-                    vertex->clearVisibleNeighborsCache();
-                }
-            }
-        }
     }
     polygons.clear();
+
+    // Clear polygon graph
+    mPolygonGraph.adjacency.clear();
+    mPolygonGraph.representatives.clear();
+    mPolygonGraph.numPolygons = 0;
 
     // Clear manual lines
     {
@@ -1847,6 +2563,8 @@ void HierarchicalVisibilityGraph::clear()
         lvl.adjacency.clear();
         lvl.vertexIndex.clear();
         lvl.vertexPolygonId.clear();
+        lvl.outerRings.clear();
+        lvl.holeRings.clear();
     }
 }
 
@@ -1855,11 +2573,10 @@ void HierarchicalVisibilityGraph::setPolygons(
 {
     mLevel0AdjReady.store(false, std::memory_order_release);
 
-    // Clear ownership from old vertices
-    for (const auto& polygon : polygons)
+    // Clear ownership from ALL level vertices (including simplified)
+    for (int i = 0; i < NUM_LEVELS; ++i)
     {
-        if (!polygon) continue;
-        for (const auto& vertex : polygon->outer())
+        for (const auto& vertex : mLevels[i].vertices)
         {
             if (vertex)
             {
@@ -1867,22 +2584,16 @@ void HierarchicalVisibilityGraph::setPolygons(
                 vertex->clearVisibleNeighborsCache();
             }
         }
-        for (const auto& hole : polygon->inners())
-        {
-            for (const auto& vertex : hole)
-            {
-                if (vertex)
-                {
-                    vertex->clearOwningPolygons();
-                    vertex->clearVisibleNeighborsCache();
-                }
-            }
-        }
     }
+
+    // Clear polygon graph
+    mPolygonGraph.adjacency.clear();
+    mPolygonGraph.representatives.clear();
+    mPolygonGraph.numPolygons = 0;
 
     polygons = newPolygons;
 
-    // Set ownership on new vertices
+    // Set ownership on new L0 vertices
     for (const auto& polygon : polygons)
     {
         if (!polygon) continue;
@@ -1913,6 +2624,8 @@ void HierarchicalVisibilityGraph::setPolygons(
         lvl.adjacency.clear();
         lvl.vertexIndex.clear();
         lvl.vertexPolygonId.clear();
+        lvl.outerRings.clear();
+        lvl.holeRings.clear();
     }
 
     buildAllLevels();
