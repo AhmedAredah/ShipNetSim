@@ -228,24 +228,90 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
     QElapsedTimer timer;
     timer.start();
 
-    // Level 0: O(n²) full visibility — comprehensive adjacency for
-    // the AdjBuilder cache. No distance limit, enabling direct
-    // cross-ocean edges. Only called from buildLevel0Adjacency()
-    // (ShipNetSimAdjBuilder tool), never at runtime.
+    // Level 0: O(n²) with adaptive distance filter — comprehensive
+    // adjacency for the AdjBuilder cache. Only called from
+    // buildLevel0Adjacency() (ShipNetSimAdjBuilder tool), never at
+    // runtime (runtime uses precomputeCorridorAdjacency instead).
     if (idx == 0)
     {
-        qDebug() << "Building L0 adjacency (O(n²) full visibility)"
-                 << "with" << n << "vertices";
+        // Adaptive distance: for small datasets (coarse resolution),
+        // check all pairs (no distance limit) since O(n²) is fast.
+        // For large datasets (dense resolution), use 50km limit to
+        // keep the build tractable (~54 min for 446K vertices).
+        // Threshold: 10K vertices ≈ O(50M) pairs, ~80s with filter.
+        double l0MaxDist = (n < 10000) ? 0.0 : 50000.0;
+
+        qDebug() << "Building L0 adjacency (O(n²), maxDist="
+                 << l0MaxDist / 1000.0 << "km) with"
+                 << n << "vertices";
+
+        // Pre-extract coordinates for fast haversine in the inner loop
+        std::vector<double> l0Lons(n), l0Lats(n);
+        for (int i = 0; i < n; ++i)
+        {
+            l0Lons[i] = level.vertices[i]->getLongitude().value();
+            l0Lats[i] = level.vertices[i]->getLatitude().value();
+        }
+
+        long long totalPairs =
+            static_cast<long long>(n) * (n - 1) / 2;
+        long long pairsChecked = 0;
+        long long edgesAdded = 0;
+        qint64 lastReportMs = 0;
 
         for (int i = 0; i < n; ++i)
         {
             for (int j = i + 1; j < n; ++j)
             {
-                if (isVisible(level.vertices[i], level.vertices[j], 0))
+                // Haversine distance pre-filter (skip if no limit)
+                if (l0MaxDist > 0.0)
+                {
+                    double dist = GSegment::haversineRaw(
+                        l0Lons[i], l0Lats[i],
+                        l0Lons[j], l0Lats[j]);
+                    if (dist > l0MaxDist) continue;
+                }
+
+                if (isVisible(level.vertices[i],
+                              level.vertices[j], 0))
                 {
                     level.adjacency[i].push_back(j);
                     level.adjacency[j].push_back(i);
+                    edgesAdded++;
                 }
+            }
+
+            pairsChecked += (n - i - 1);
+
+            // Progress reporting every 10 seconds
+            qint64 nowMs = timer.elapsed();
+            if (nowMs - lastReportMs >= 10000)
+            {
+                lastReportMs = nowMs;
+                double pct =
+                    100.0 * pairsChecked / totalPairs;
+                double elapsedSec = nowMs / 1000.0;
+                double etaSec = (pct > 0.01)
+                    ? elapsedSec / pct * (100.0 - pct)
+                    : 0.0;
+                qDebug().noquote()
+                    << QString(
+                           "  L0: %1% | vertex %2/%3 | "
+                           "%4 edges | ETA %5")
+                           .arg(pct, 0, 'f', 1)
+                           .arg(i + 1)
+                           .arg(n)
+                           .arg(edgesAdded)
+                           .arg(etaSec < 3600
+                                    ? QString("%1 min")
+                                          .arg(etaSec / 60.0,
+                                               0, 'f', 1)
+                                    : QString("%1 hr")
+                                          .arg(etaSec / 3600.0,
+                                               0, 'f', 1));
+
+                emit pathFindingProgress(
+                    i + 1, n, elapsedSec);
             }
         }
 
@@ -253,7 +319,8 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
         for (const auto& adj : level.adjacency)
             totalEdges += adj.size();
         qDebug() << "L0 adjacency built in" << timer.elapsed() << "ms,"
-                 << totalEdges << "directed edges";
+                 << totalEdges << "directed edges ("
+                 << edgesAdded << "unique)";
         return;
     }
 
