@@ -61,7 +61,60 @@ HierarchicalVisibilityGraph::HierarchicalVisibilityGraph(
         }
     }
 
+    computeDynamicParameters();
     buildAllLevels();
+}
+
+// =============================================================================
+// Dynamic Level Parameters
+// =============================================================================
+
+void HierarchicalVisibilityGraph::computeDynamicParameters()
+{
+    // Compute average outer ring edge length as data resolution metric.
+    // Only outer rings are sampled — holes are typically smaller and
+    // would bias the estimate downward.
+    double totalLength = 0.0;
+    int edgeCount = 0;
+
+    for (const auto& poly : polygons)
+    {
+        if (!poly) continue;
+        const auto& outer = poly->outer();
+        int sz = outer.size();
+        if (sz < 2) continue;
+
+        for (int i = 0; i < sz; ++i)
+        {
+            const auto& a = outer[i];
+            const auto& b = outer[(i + 1) % sz];
+            if (!a || !b) continue;
+            totalLength += GSegment::haversineRaw(
+                a->getLongitude().value(), a->getLatitude().value(),
+                b->getLongitude().value(), b->getLatitude().value());
+            ++edgeCount;
+        }
+    }
+
+    // Floor at 1km to prevent degenerate parameters
+    double avgSpacing = (edgeCount > 0)
+        ? std::max(1000.0, totalLength / edgeCount)
+        : 10000.0;  // default to ne_10m-like resolution
+
+    for (int i = 0; i < NUM_LEVELS; ++i)
+    {
+        mLevelTolerances[i] = TOLERANCE_FACTORS[i] * avgSpacing;
+        mLevelMaxDistance[i] = DISTANCE_FACTORS[i] * avgSpacing;
+    }
+
+    qDebug() << "Dynamic level parameters: avgSpacing ="
+             << avgSpacing / 1000.0 << "km";
+    for (int i = 0; i < NUM_LEVELS; ++i)
+    {
+        qDebug() << "  L" << i
+                 << ": tolerance =" << mLevelTolerances[i] / 1000.0 << "km"
+                 << ", maxDist =" << mLevelMaxDistance[i] / 1000.0 << "km";
+    }
 }
 
 HierarchicalVisibilityGraph::~HierarchicalVisibilityGraph()
@@ -93,7 +146,7 @@ void HierarchicalVisibilityGraph::buildLevel(int idx)
 {
     auto& level = mLevels[idx];
     level.levelIndex = idx;
-    level.toleranceMeters = LEVEL_TOLERANCES[idx];
+    level.toleranceMeters = mLevelTolerances[idx];
 
     if (idx == 0)
     {
@@ -206,16 +259,7 @@ void HierarchicalVisibilityGraph::buildLevel(int idx)
              << level.vertices.size();
 }
 
-// Per-level maximum distance thresholds (meters) for adjacency pre-filter.
-// Pairs beyond this distance skip the expensive visibility check.
-// Level 0 uses 0.0 (no cutoff — full resolution, pre-computed separately).
-static constexpr double LEVEL_MAX_DISTANCE[
-    HierarchicalVisibilityGraph::NUM_LEVELS] = {
-    0.0,        // Level 0: not used here
-    200000.0,   // Level 1: 200 km
-    500000.0,   // Level 2: 500 km
-    2000000.0   // Level 3: 2000 km
-};
+// (LEVEL_MAX_DISTANCE removed — replaced by dynamic mLevelMaxDistance member)
 
 void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
 {
@@ -239,7 +283,8 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
         // For large datasets (dense resolution), use 50km limit to
         // keep the build tractable (~54 min for 446K vertices).
         // Threshold: 10K vertices ≈ O(50M) pairs, ~80s with filter.
-        double l0MaxDist = (n < 10000) ? 0.0 : 50000.0;
+        double l0MaxDist = (n < 10000)
+            ? 0.0 : mLevelMaxDistance[0];
 
         qDebug() << "Building L0 adjacency (O(n²), maxDist="
                  << l0MaxDist / 1000.0 << "km) with"
@@ -325,7 +370,7 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
     }
 
     // Levels 1-3: phased approach (fast, skip-vis for corridor guidance)
-    double maxDist = LEVEL_MAX_DISTANCE[idx];
+    double maxDist = mLevelMaxDistance[idx];
 
     qDebug() << "Building adjacency for level" << idx
              << "with" << n << "vertices (phased, maxDist="
@@ -1338,7 +1383,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     bestCoarseResult = result3;
 
     // --- Level 2 ---
-    double expansion2 = LEVEL_TOLERANCES[3] * 3.0;
+    double expansion2 = mLevelTolerances[3] * 3.0;
     auto corridor2 = buildCorridor(result3, 2, expansion2);
     auto result2 = aStarAtLevel(start, goal, 2, &corridor2,
                                 snappedStart, snappedGoal);
@@ -1356,7 +1401,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     }
 
     // --- Level 1 ---
-    double expansion1 = LEVEL_TOLERANCES[2] * 3.0;
+    double expansion1 = mLevelTolerances[2] * 3.0;
     auto corridor1 = buildCorridor(bestCoarseResult, 1, expansion1);
     auto result1 = aStarAtLevel(start, goal, 1, &corridor1,
                                 snappedStart, snappedGoal);
@@ -1376,7 +1421,7 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
     // --- Level 0 (original polygons — only valid final result) ---
 
-    double expansion0 = LEVEL_TOLERANCES[1] * 3.0;
+    double expansion0 = mLevelTolerances[1] * 3.0;
     bool hasLevel0Adj = mLevel0AdjReady.load(std::memory_order_acquire);
 
     if (hasLevel0Adj)
@@ -2695,6 +2740,7 @@ void HierarchicalVisibilityGraph::setPolygons(
         lvl.holeRings.clear();
     }
 
+    computeDynamicParameters();
     buildAllLevels();
 }
 

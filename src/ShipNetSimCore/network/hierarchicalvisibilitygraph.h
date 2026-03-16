@@ -115,9 +115,6 @@ class HierarchicalVisibilityGraph : public QObject
 
 public:
     static constexpr int NUM_LEVELS = 4;
-    static constexpr double LEVEL_TOLERANCES[NUM_LEVELS] = {
-        0.0, 2000.0, 10000.0, 50000.0
-    };
 
     HierarchicalVisibilityGraph();
 
@@ -205,14 +202,28 @@ private:
     static constexpr double PORTAL_ZONE_DEGREES = 30.0;
     static constexpr double PORTAL_LAT_TOLERANCE = 10.0;
 
-    // Per-level maximum distance for adjacency building (meters)
-    static constexpr double LEVEL_MAX_DISTANCE[NUM_LEVELS] = {
-        50000.0, 2000000.0, 5000000.0, 2000000.0
+    // Hierarchy shape factors — resolution-independent multipliers
+    // applied to the data's average vertex spacing. Derived from proven
+    // ne_10m values (avgSpacing ≈ 10km): L1=2km, L2=10km, L3=50km
+    // tolerances; L0=50km, L1=200km, L2=500km, L3=2000km max distances.
+    static constexpr double TOLERANCE_FACTORS[NUM_LEVELS] = {
+        0.0, 0.2, 1.0, 5.0
     };
+    static constexpr double DISTANCE_FACTORS[NUM_LEVELS] = {
+        5.0, 20.0, 50.0, 200.0
+    };
+
+    // Dynamic level parameters computed from input data resolution
+    double mLevelTolerances[NUM_LEVELS] = {};
+    double mLevelMaxDistance[NUM_LEVELS] = {};
+
     // Per-level cap on cross-polygon edges per vertex
     static constexpr int LEVEL_MAX_CROSS_CHECKS[NUM_LEVELS] = {
         10, 20, 30, 50
     };
+
+    /** @brief Compute dynamic level parameters from polygon vertex spacing. */
+    void computeDynamicParameters();
 
     void buildAllLevels();
     void buildLevel(int idx);
