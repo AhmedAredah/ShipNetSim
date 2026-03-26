@@ -359,7 +359,7 @@ enable_testing()
 # Add test directory when BUILD_TESTING is enabled
 # Note: For multi-config generators (Visual Studio, Xcode), the build type is selected at build time,
 # so we add the test targets unconditionally when BUILD_TESTING is ON
-option(BUILD_TESTING "Build the testing tree." OFF)
+option(BUILD_TESTING "Build the testing tree." ON)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

@@ -83,6 +83,51 @@ private:
     /// Built lazily on first query via ensureOuterRingIndex().
     mutable OuterRingSpatialIndex mOuterRingIndex;
 
+    // -----------------------------------------------------------------
+    // Ring topology: coordinate → ring-position map for adjacency checks
+    // -----------------------------------------------------------------
+
+    /** @brief Quantized coordinate key for O(1) ring position lookup. */
+    struct CoordKey
+    {
+        long long lonQ;  ///< round(longitude * 1e9)
+        long long latQ;  ///< round(latitude  * 1e9)
+
+        static CoordKey from(double lon, double lat)
+        {
+            return {static_cast<long long>(std::round(lon * 1e9)),
+                    static_cast<long long>(std::round(lat * 1e9))};
+        }
+        bool operator==(const CoordKey& o) const
+        {
+            return lonQ == o.lonQ && latQ == o.latQ;
+        }
+        struct Hash
+        {
+            size_t operator()(const CoordKey& k) const
+            {
+                size_t h1 = std::hash<long long>()(k.lonQ);
+                size_t h2 = std::hash<long long>()(k.latQ);
+                return h1 ^ (h2 * 2654435761ULL);
+            }
+        };
+    };
+
+    /** @brief Position of a vertex within a specific hole ring. */
+    struct RingPos
+    {
+        int holeIdx;   ///< Interior ring index
+        int pos;       ///< 0-based position within the ring (excluding closing point)
+        int ringSize;  ///< Number of unique vertices in the ring
+    };
+
+    mutable bool mRingPosBuilt = false;
+    mutable std::unordered_map<CoordKey, RingPos, CoordKey::Hash>
+        mRingPositionMap;
+
+    /** @brief Build ring position map lazily on first use. */
+    void ensureRingPositionMap() const;
+
     // =========================================================================
     // Private Helper Methods
     // =========================================================================
@@ -303,6 +348,18 @@ public:
     int findContainingHoleIndex(const GPoint &pointToCheck) const;
 
     /**
+     * @brief Check if a point lies on the boundary of a specific hole ring.
+     *
+     * Uses OGR isPointOnRingBoundary (with tolerance) for an exact check
+     * that avoids the ray-casting ambiguity of findContainingHoleIndex.
+     *
+     * @param pt The point to test
+     * @param holeIndex The hole ring index (0-based)
+     * @return true if the point is on the hole's ring boundary
+     */
+    bool isPointOnHoleBoundary(const GPoint &pt, int holeIndex) const;
+
+    /**
      * @brief Check if a point is within the polygon (excluding holes).
      *
      * Returns true if the point is inside the exterior ring but not
@@ -326,6 +383,24 @@ public:
      * @return true if point is on any ring boundary
      */
     bool ringsContain(std::shared_ptr<GPoint> point) const;
+
+    /**
+     * @brief Check if two hole-boundary vertices are adjacent on their ring.
+     *
+     * Returns true only if the two coordinates are consecutive vertices
+     * (prev/next) on the specified hole ring. Used to distinguish genuine
+     * boundary edges from non-adjacent chords that cross the hole interior.
+     *
+     * @param lon1 Longitude of first vertex
+     * @param lat1 Latitude of first vertex
+     * @param lon2 Longitude of second vertex
+     * @param lat2 Latitude of second vertex
+     * @param holeIndex The hole ring both vertices belong to
+     * @return true if vertices are adjacent (consecutive) on the ring
+     */
+    bool areVerticesAdjacentOnHole(double lon1, double lat1,
+                                   double lon2, double lat2,
+                                   int holeIndex) const;
 
     // =========================================================================
     // Line and Segment Operations

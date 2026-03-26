@@ -12,6 +12,8 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <functional>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -24,6 +26,24 @@ struct ShortestPathResult
     QVector<std::shared_ptr<GPoint>> points;
 
     bool isValid() const;
+};
+
+/**
+ * @struct HVGDiagnostics
+ * @brief Read-only snapshot of HVG internal state for diagnostic purposes.
+ */
+struct HVGDiagnostics
+{
+    struct LevelInfo
+    {
+        int vertexCount = 0;
+        long long edgeCount = 0;   ///< Unique undirected edges
+        double toleranceMeters = 0.0;
+        double maxDistanceMeters = 0.0;
+    };
+    std::array<LevelInfo, 4> levels;
+    bool level0AdjReady = false;
+    int polygonGraphPolygonCount = 0;
 };
 
 /**
@@ -50,6 +70,7 @@ struct GraphLevel
     std::unordered_map<std::shared_ptr<GPoint>, int,
         GPoint::Hash, GPoint::Equal> vertexIndex;
     std::vector<int> vertexPolygonId;
+    std::vector<int> vertexHoleId;  ///< Maps vertex idx → hole index (-1 = outer ring)
     mutable QReadWriteLock lock;
 
     /// Ring layout metadata — one outer ring range per polygon
@@ -160,6 +181,12 @@ public:
     bool saveAdjacencyCache(const QString& filePath) const;
     bool loadAdjacencyCache(const QString& filePath);
 
+    /** @brief Return a diagnostic snapshot of internal state. */
+    HVGDiagnostics getDiagnostics() const;
+
+    /** @brief Read-only access to a graph level for diagnostics/export. */
+    const GraphLevel& getLevel(int idx) const { return mLevels[idx]; }
+
     bool enableWrapAround;
 
     std::unordered_set<std::shared_ptr<GLine>, GLine::Hash, GLine::Equal>
@@ -202,25 +229,54 @@ private:
     static constexpr double PORTAL_ZONE_DEGREES = 30.0;
     static constexpr double PORTAL_LAT_TOLERANCE = 10.0;
 
-    // Hierarchy shape factors — resolution-independent multipliers
-    // applied to the data's average vertex spacing. Derived from proven
-    // ne_10m values (avgSpacing ≈ 10km): L1=2km, L2=10km, L3=50km
-    // tolerances; L0=50km, L1=200km, L2=500km, L3=2000km max distances.
+    // =============================================================
+    // Data Resolution Parameters — scale with input vertex spacing
+    // =============================================================
+
+    /// Simplification tolerance multipliers applied to avgSpacing.
     static constexpr double TOLERANCE_FACTORS[NUM_LEVELS] = {
         0.0, 0.2, 1.0, 5.0
     };
-    static constexpr double DISTANCE_FACTORS[NUM_LEVELS] = {
-        5.0, 20.0, 50.0, 200.0
+
+    /// Dynamic tolerances computed from input data resolution.
+    double mLevelTolerances[NUM_LEVELS] = {};
+
+    /// Average outer-ring edge length (meters). Set in computeDynamicParameters().
+    /// Used by data-adaptive algorithms (local visible, Yao spanner).
+    double mAvgSpacing = 10000.0;
+
+    /// Number of angular cones for Yao-style directional searches.
+    /// k=8 gives t-spanner with stretch ≤ 1/(1-2sin(π/8)) ≈ 4.6.
+    static constexpr int YAO_CONE_COUNT = 8;
+
+    /// Express vertex step: sample every N-th vertex on large rings.
+    /// Controls intra-ring express density (lower = denser, slower build).
+    static constexpr int EXPRESS_VERTEX_STEP = 100;
+
+    // =============================================================
+    // Routing Parameters — absolute values (meters) for global
+    // maritime routing. Independent of data resolution.
+    // =============================================================
+
+    /// Maximum adjacency edge distance per level.
+    static constexpr double LEVEL_MAX_DISTANCE[NUM_LEVELS] = {
+        50000.0, 2000000.0, 5000000.0, 2000000.0
     };
 
-    // Dynamic level parameters computed from input data resolution
-    double mLevelTolerances[NUM_LEVELS] = {};
-    double mLevelMaxDistance[NUM_LEVELS] = {};
+    /// Corridor tube width per level. Controls how wide the search
+    /// area is around the coarse path. Wider fallbacks (3x, 10x)
+    /// are applied automatically when the initial corridor fails.
+    static constexpr double CORRIDOR_EXPANSION[NUM_LEVELS] = {
+        6000.0, 30000.0, 150000.0, 0.0
+    };
 
-    // Per-level cap on cross-polygon edges per vertex
+    /// Per-level cap on cross-polygon edges per vertex.
     static constexpr int LEVEL_MAX_CROSS_CHECKS[NUM_LEVELS] = {
         10, 20, 30, 50
     };
+
+    /// Runtime copy of max distances (initialized from LEVEL_MAX_DISTANCE).
+    double mLevelMaxDistance[NUM_LEVELS] = {};
 
     /** @brief Compute dynamic level parameters from polygon vertex spacing. */
     void computeDynamicParameters();
@@ -236,13 +292,63 @@ private:
     /** @brief Phase 1: Add consecutive ring edges — O(n), no visibility. */
     void addBoundaryEdges(GraphLevel& level);
 
-    /** @brief Phase 2: Add spatial-grid edges — O(n×k), skip-vis for L1+. */
+    /** @brief Phase 2: Add spatial-grid edges — O(n×k).
+     *  @param checkVisibility When true, only add edges that pass
+     *         isVisible(). When false (default), skip-vis for corridor guidance.
+     */
     void addSpatialGridEdges(GraphLevel& level, int levelIdx,
-                             double maxDist);
+                             double maxDist,
+                             bool checkVisibility = false);
 
-    /** @brief Phase 3: Add antimeridian bridging edges. */
+    /** @brief Shared helper: find nearest visible vertex in each uncovered
+     *  octant via expanding Quadtree search. Applies candidateFilter to
+     *  exclude unwanted candidates (same ring, same component, etc.).
+     *  @param waterArc Optional angular range (center, halfWidth) in radians.
+     *         When set, only cones overlapping this arc are searched.
+     *  @return Number of edges added. */
+    int connectOctantNearest(
+        GraphLevel& level, int levelIdx,
+        int sourceIdx,
+        const std::vector<double>& lons,
+        const std::vector<double>& lats,
+        double initRadiusDeg, double maxSearchDeg,
+        const std::function<bool(int)>& candidateFilter,
+        std::optional<std::pair<double, double>> waterArc = std::nullopt);
+
+    /** @brief Compute water-facing angular arc for a ring boundary vertex.
+     *  Uses ring neighbors and isPointWithinPolygon bisector test.
+     *  @return (arcCenter, arcHalfWidth) in radians, or nullopt if not a ring vertex. */
+    std::optional<std::pair<double, double>> computeWaterArc(
+        int vertexIdx, int level,
+        const std::vector<double>& lons,
+        const std::vector<double>& lats) const;
+
+    /** @brief Phase 2 (L0): Add express edges on large rings.
+     *  Samples evenly-spaced vertices on rings larger than YAO_CONE_COUNT
+     *  and adds Yao-k octant-nearest visible edges. Creates "highway" edges
+     *  along long coastlines so A* doesn't follow every boundary edge.
+     *  No distance limit — expanding Quadtree search. */
+    void addIntraRingExpressEdges(GraphLevel& level, int levelIdx);
+
+    /** @brief Phase 3 (L0): Bridge nearby ring pairs with directional edges.
+     *  For each pair of geographically nearby rings, finds directional
+     *  bridges from representative vertices (N/S/E/W extremes).
+     *  Uses HoleSpatialIndex + RingRange for ring-pair discovery. */
+    void addInterRingBridges(GraphLevel& level, int levelIdx);
+
+    /** @brief Phase 4 (L0): Merge disconnected components using Borůvka-like
+     *  nearest-visible edge merging with directional (octant) coverage.
+     *  Components halve each iteration → O(log C) iterations.
+     *  Guarantees single connected component. */
+    void bridgeConnectedComponents(GraphLevel& level, int levelIdx);
+
+    /** @brief Phase 5: Add antimeridian bridging edges.
+     *  @param checkVisibility When true (L0), only add edges that pass
+     *         isVisible(). When false (L1-L3), skip-vis for corridor guidance.
+     */
     void addAntimeridianEdges(GraphLevel& level, int levelIdx,
-                              double maxDist);
+                              double maxDist,
+                              bool checkVisibility = false);
 
     // -----------------------------------------------------------------
     // Polygon graph (coarse L3 routing)
@@ -296,18 +402,40 @@ private:
     std::shared_ptr<GPoint> snapToWater(
         const std::shared_ptr<GPoint>& point, int level) const;
 
-    ShortestPathResult aStarAtLevel(
+    /** @brief Core graph search — A* (useHeuristic=true) or Dijkstra (false).
+     *  @param useHeuristic  true = haversine A*, false = Dijkstra (h=0)
+     *  @param maxExpansions  -1 = unlimited, >0 = budget (returns invalid if exceeded)
+     */
+    ShortestPathResult searchAtLevel(
         const std::shared_ptr<GPoint>& start,
         const std::shared_ptr<GPoint>& goal,
         int level,
         const Corridor* corridor = nullptr,
         const std::shared_ptr<GPoint>& preSnappedStart = nullptr,
-        const std::shared_ptr<GPoint>& preSnappedGoal = nullptr);
+        const std::shared_ptr<GPoint>& preSnappedGoal = nullptr,
+        bool useHeuristic = true,
+        int maxExpansions = -1);
 
     Corridor buildCorridor(
         const ShortestPathResult& coarsePath,
         int targetLevel,
-        double expansion);
+        double expansion,
+        bool useTubeFilter = true);
+
+    /** @brief Get ring neighbor vertex indices for a vertex in a GraphLevel.
+     *  @return (prevIdx, nextIdx) in GraphLevel::vertices, or (-1,-1) if invalid.
+     */
+    std::pair<int,int> getRingNeighbors(int vertexIdx, int level) const;
+
+    /** @brief Bridge disconnected L0 segments via directional visibility
+     *         from ring topology. Called when cached bbox corridors all fail.
+     */
+    ShortestPathResult bridgeViaDirectionalVisibility(
+        const ShortestPathResult& coarsePath,
+        const std::shared_ptr<GPoint>& start,
+        const std::shared_ptr<GPoint>& goal,
+        const std::shared_ptr<GPoint>& snappedStart,
+        const std::shared_ptr<GPoint>& snappedGoal);
 
     void precomputeCorridorAdjacency(
         Corridor& corridor,
@@ -321,11 +449,6 @@ private:
 
     ShortestPathResult findShortestPathHelper(
         QVector<std::shared_ptr<GPoint>> mustTraversePoints);
-
-    bool isVisibleInSimplifiedPolygon(
-        const std::shared_ptr<GPoint>& v1,
-        const std::shared_ptr<GPoint>& v2,
-        const std::shared_ptr<Polygon>& poly) const;
 
     ShortestPathResult reconstructPath(
         const std::unordered_map<

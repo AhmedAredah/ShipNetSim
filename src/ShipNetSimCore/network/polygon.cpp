@@ -339,6 +339,63 @@ void Polygon::ensureOuterRingIndex() const
         mOuterRingIndex.build(mOutterBoundary);
 }
 
+void Polygon::ensureRingPositionMap() const
+{
+    if (mRingPosBuilt) return;
+    mRingPosBuilt = true;
+
+    int numHoles = mPolygon.getNumInteriorRings();
+    if (numHoles == 0) return;
+
+    // Pre-size: estimate total hole vertices for hash map reservation
+    int totalVerts = 0;
+    for (int h = 0; h < numHoles; ++h)
+    {
+        const OGRLinearRing* ring = mPolygon.getInteriorRing(h);
+        if (ring)
+            totalVerts += ring->getNumPoints() - 1;  // -1: closing pt
+    }
+    mRingPositionMap.reserve(totalVerts);
+
+    for (int h = 0; h < numHoles; ++h)
+    {
+        const OGRLinearRing* ring = mPolygon.getInteriorRing(h);
+        if (!ring) continue;
+
+        int ringSize = ring->getNumPoints() - 1;  // unique vertices
+        if (ringSize < 2) continue;
+
+        for (int i = 0; i < ringSize; ++i)
+        {
+            CoordKey key = CoordKey::from(ring->getX(i), ring->getY(i));
+            mRingPositionMap[key] = {h, i, ringSize};
+        }
+    }
+}
+
+bool Polygon::areVerticesAdjacentOnHole(
+    double lon1, double lat1,
+    double lon2, double lat2,
+    int holeIndex) const
+{
+    ensureRingPositionMap();
+
+    auto it1 = mRingPositionMap.find(CoordKey::from(lon1, lat1));
+    auto it2 = mRingPositionMap.find(CoordKey::from(lon2, lat2));
+
+    if (it1 == mRingPositionMap.end() || it2 == mRingPositionMap.end())
+        return false;  // Not a known ring vertex
+
+    if (it1->second.holeIdx != holeIndex || it2->second.holeIdx != holeIndex)
+        return false;  // Not on the expected hole
+
+    int diff = std::abs(it1->second.pos - it2->second.pos);
+    int ringSize = it1->second.ringSize;
+
+    // Adjacent: consecutive positions, or wrap-around (first↔last)
+    return (diff == 1 || diff == ringSize - 1);
+}
+
 const OuterRingSpatialIndex& Polygon::outerRingIndex() const
 {
     ensureOuterRingIndex();
@@ -405,6 +462,17 @@ int Polygon::findContainingHoleIndex(const GPoint &pointToCheck) const
         return false;
     });
     return result;
+}
+
+bool Polygon::isPointOnHoleBoundary(const GPoint &pt, int holeIndex) const
+{
+    if (holeIndex < 0 || holeIndex >= mPolygon.getNumInteriorRings())
+        return false;
+    const OGRLinearRing *ring = mPolygon.getInteriorRing(holeIndex);
+    if (!ring)
+        return false;
+    const OGRPoint ogrPt = pt.getGDALPoint();
+    return ring->isPointOnRingBoundary(&ogrPt, TRUE);
 }
 
 bool Polygon::isPointWithinPolygon(const GPoint &pointToCheck) const
@@ -778,14 +846,21 @@ bool Polygon::isSegmentPassingThroughHole(
     bool startOnBoundary = hole->isPointOnRingBoundary(&startOGR, TRUE);
     bool endOnBoundary   = hole->isPointOnRingBoundary(&endOGR, TRUE);
 
-    // If both points are on boundary and segment is short, allow it
+    // Both endpoints on the same hole boundary: only exempt if they are
+    // ADJACENT ring vertices (prev/next). Adjacent vertices form actual
+    // polygon boundary edges whose midpoints naturally fall inside the
+    // hole. Non-adjacent same-hole chords cut through the hole interior
+    // (land) and must be checked via sampling.
     if (startOnBoundary && endOnBoundary)
     {
-        if (segment->startPoint()->distance(*segment->endPoint()).value() <
-            SHORT_SEGMENT_THRESHOLD_METERS)
-        {
-            return false;
-        }
+        double sLon = segment->startPoint()->getLongitude().value();
+        double sLat = segment->startPoint()->getLatitude().value();
+        double eLon = segment->endPoint()->getLongitude().value();
+        double eLat = segment->endPoint()->getLatitude().value();
+
+        if (areVerticesAdjacentOnHole(sLon, sLat, eLon, eLat, holeIndex))
+            return false;  // Adjacent boundary edge — exempt
+        // Non-adjacent: fall through to interior sampling
     }
 
     // Sample points along the segment
