@@ -303,7 +303,7 @@ void RealWorldShortestPathTest::initTestCase()
 
     // Verify polygons were loaded (catches MultiPolygon regression)
     auto hvg = mNetwork->getVisibilityGraph();
-    if (!hvg || hvg->polygons.isEmpty()) {
+    if (!hvg || hvg->getPolygons().isEmpty()) {
         qWarning() << "Network loaded but no polygons found — "
                       "possible wkbMultiPolygon handling bug";
         mDataAvailable = false;
@@ -312,7 +312,7 @@ void RealWorldShortestPathTest::initTestCase()
     }
 
     qDebug() << "Network loaded in" << timer.elapsed() / 1000.0 << "s"
-             << "with" << hvg->polygons.size() << "polygons";
+             << "with" << hvg->getPolygons().size() << "polygons";
     mDataAvailable = true;
 }
 
@@ -631,8 +631,8 @@ void RealWorldShortestPathTest::testDiag_PointContainment()
     };
 
     qWarning() << "=== POINT CONTAINMENT DIAGNOSTIC ===";
-    qWarning() << "Dataset polygons:" << hvg->polygons.size();
-    for (const auto &poly : hvg->polygons) {
+    qWarning() << "Dataset polygons:" << hvg->getPolygons().size();
+    for (const auto &poly : hvg->getPolygons()) {
         qWarning() << "  Polygon: outer=" << poly->outer().size()
                     << "vertices, holes=" << poly->inners().size();
     }
@@ -643,8 +643,8 @@ void RealWorldShortestPathTest::testDiag_PointContainment()
         // Check containment in each polygon
         bool inAnyPoly = false;
         int holeIdx = -1;
-        for (int pi = 0; pi < hvg->polygons.size(); ++pi) {
-            const auto &poly = hvg->polygons[pi];
+        for (int pi = 0; pi < hvg->getPolygons().size(); ++pi) {
+            const auto &poly = hvg->getPolygons()[pi];
             bool inExterior = poly->isPointWithinExteriorRing(*pt);
             int hole = poly->findContainingHoleIndex(*pt);
             bool inPoly = poly->isPointWithinPolygon(*pt);
@@ -662,7 +662,7 @@ void RealWorldShortestPathTest::testDiag_PointContainment()
 
         // Find nearest vertex across all polygons
         double minDistKm = std::numeric_limits<double>::max();
-        for (const auto &poly : hvg->polygons) {
+        for (const auto &poly : hvg->getPolygons()) {
             for (const auto &v : poly->outer()) {
                 double d = pt->fastDistance(*v).value() / 1000.0;
                 if (d < minDistKm) minDistKm = d;
@@ -869,8 +869,8 @@ void RealWorldShortestPathTest::testDiag_AntwerpenSnapping()
     qWarning() << "\n=== ANTWERPEN SNAPPING DIAGNOSTIC ===";
 
     // 1. Check point containment at L0 (original polygons)
-    for (int pi = 0; pi < hvg->polygons.size(); ++pi) {
-        const auto &poly = hvg->polygons[pi];
+    for (int pi = 0; pi < hvg->getPolygons().size(); ++pi) {
+        const auto &poly = hvg->getPolygons()[pi];
         bool inExterior = poly->isPointWithinExteriorRing(*antwerpen);
         int hole = poly->findContainingHoleIndex(*antwerpen);
         bool inPoly = poly->isPointWithinPolygon(*antwerpen);
@@ -931,7 +931,7 @@ void RealWorldShortestPathTest::testDiag_LevelStructure()
     // Compute avgSpacing (same algorithm as computeDynamicParameters)
     double totalLength = 0.0;
     int edgeCount = 0;
-    for (const auto &poly : hvg->polygons) {
+    for (const auto &poly : hvg->getPolygons()) {
         if (!poly) continue;
         const auto &outer = poly->outer();
         int sz = outer.size();
@@ -1006,8 +1006,8 @@ static void traceRoute(
         double nearestVertDist = std::numeric_limits<double>::max();
         std::shared_ptr<GPoint> nearestVert;
 
-        for (int pi = 0; pi < hvg->polygons.size(); ++pi) {
-            const auto &poly = hvg->polygons[pi];
+        for (int pi = 0; pi < hvg->getPolygons().size(); ++pi) {
+            const auto &poly = hvg->getPolygons()[pi];
             if (poly->isPointWithinExteriorRing(*pt)) {
                 int h = poly->findContainingHoleIndex(*pt);
                 if (h >= 0) { holeIdx = h; polyIdx = pi; }
@@ -1049,7 +1049,7 @@ static void traceRoute(
         if (nearestVert) {
             int visCount = 0;
             int checkCount = 0;
-            for (const auto &poly : hvg->polygons) {
+            for (const auto &poly : hvg->getPolygons()) {
                 // Check outer ring vertices
                 for (const auto &v : poly->outer()) {
                     if (*v == *nearestVert) continue;
@@ -1137,14 +1137,14 @@ void RealWorldShortestPathTest::testDiag_RouteSantosParanagua()
         bool inWater = false;
         int holeIdx = -1;
         int polyIdx = -1;
-        for (int pi = 0; pi < hvg->polygons.size(); ++pi) {
-            if (hvg->polygons[pi]->isPointWithinPolygon(*pt)) {
+        for (int pi = 0; pi < hvg->getPolygons().size(); ++pi) {
+            if (hvg->getPolygons()[pi]->isPointWithinPolygon(*pt)) {
                 inWater = true;
                 polyIdx = pi;
                 break;
             }
-            if (hvg->polygons[pi]->isPointWithinExteriorRing(*pt)) {
-                int h = hvg->polygons[pi]->findContainingHoleIndex(*pt);
+            if (hvg->getPolygons()[pi]->isPointWithinExteriorRing(*pt)) {
+                int h = hvg->getPolygons()[pi]->findContainingHoleIndex(*pt);
                 if (h >= 0) { holeIdx = h; polyIdx = pi; }
             }
         }
@@ -1276,9 +1276,9 @@ void RealWorldShortestPathTest::testDiag_CrossHoleVisibility()
     skipIfNoData();
     auto hvg = mNetwork->getVisibilityGraph();
     QVERIFY(hvg);
-    QVERIFY(hvg->polygons.size() >= 1);
+    QVERIFY(hvg->getPolygons().size() >= 1);
 
-    const auto &poly = hvg->polygons[0];
+    const auto &poly = hvg->getPolygons()[0];
     const auto &holes = poly->inners();
 
     // Hole 475 = Manhattan (19 vertices)
@@ -1359,9 +1359,9 @@ void RealWorldShortestPathTest::testDiag_BoundaryVisibility()
 
     auto hvg = mNetwork->getVisibilityGraph();
     QVERIFY(hvg);
-    QVERIFY(hvg->polygons.size() >= 1);
+    QVERIFY(hvg->getPolygons().size() >= 1);
 
-    const auto &poly = hvg->polygons[0];
+    const auto &poly = hvg->getPolygons()[0];
     const auto &holes = poly->inners();
 
     // Test consecutive boundary vertex visibility on specific holes
@@ -1447,7 +1447,7 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
     skipIfNoData();
     auto hvg = mNetwork->getVisibilityGraph();
     QVERIFY(hvg);
-    QVERIFY(hvg->polygons.size() >= 1);
+    QVERIFY(hvg->getPolygons().size() >= 1);
 
     // The problematic segment from Singapore→PortSaid path
     // Bangladesh coast → Caspian coast (crosses entire South/Central Asia)
@@ -1465,9 +1465,9 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
     qWarning() << "Midpoint:" << midLon << midLat << "(should be inland Pakistan)";
 
     // --- Test 1: Polygon topology ---
-    for (int pi = 0; pi < hvg->polygons.size(); ++pi)
+    for (int pi = 0; pi < hvg->getPolygons().size(); ++pi)
     {
-        const auto &poly = hvg->polygons[pi];
+        const auto &poly = hvg->getPolygons()[pi];
         qWarning() << "\nPolygon" << pi << ":"
                    << "outer=" << poly->outer().size() << "vertices,"
                    << "holes=" << poly->inners().size();
@@ -1487,8 +1487,8 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
 
         // Test hole crossing
         auto segLine = std::make_shared<GLine>(v1, v2, FastConstruct);
-        bool validWater = poly->isValidWaterSegment(segLine);
-        qWarning() << "  isValidWaterSegment:" << validWater;
+        bool validWater = !poly->segmentCrossesHoles(segLine);
+        qWarning() << "  !segmentCrossesHoles:" << validWater;
 
         // Test multiple intermediate points
         qWarning() << "  Intermediate point checks:";
@@ -1518,7 +1518,7 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
 
     // --- Test 3: Check vertex ring info ---
     // Find nearest L0 vertices to our test points
-    const auto &lvl = hvg->polygons;  // L0 uses same polygons
+    const auto &lvl = hvg->getPolygons();  // L0 uses same polygons
     auto qt = hvg->getLevel0Quadtree();
     if (qt)
     {
@@ -1538,9 +1538,9 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
             qWarning() << "isVisible(nearL0_1, nearL0_2):" << visL0;
 
             // Check outer ring crossing for actual L0 vertices
-            for (int pi = 0; pi < hvg->polygons.size(); ++pi)
+            for (int pi = 0; pi < hvg->getPolygons().size(); ++pi)
             {
-                bool crosses = hvg->polygons[pi]->segmentCrossesOuterRing(
+                bool crosses = hvg->getPolygons()[pi]->segmentCrossesOuterRing(
                     nearV1, nearV2);
                 if (crosses)
                     qWarning() << "  L0 vertices cross outer ring of polygon"
@@ -1566,9 +1566,9 @@ void RealWorldShortestPathTest::testDiag_OuterRingVisibility()
                            : "other direction");
 
             // Check: what polygon/hole is each vertex on?
-            for (int pi = 0; pi < hvg->polygons.size(); ++pi)
+            for (int pi = 0; pi < hvg->getPolygons().size(); ++pi)
             {
-                const auto& poly = hvg->polygons[pi];
+                const auto& poly = hvg->getPolygons()[pi];
                 bool v1OnOuter = false, v2OnOuter = false;
                 for (const auto& ov : poly->outer())
                 {
@@ -1662,24 +1662,23 @@ void RealWorldShortestPathTest::testDiag_StraitVisibility()
         // Show details for mismatches
         if (!ok)
         {
-            for (int pi = 0; pi < hvg->polygons.size(); ++pi)
+            for (int pi = 0; pi < hvg->getPolygons().size(); ++pi)
             {
-                bool crossOuter = hvg->polygons[pi]->segmentCrossesOuterRing(p1, p2);
+                bool crossOuter = hvg->getPolygons()[pi]->segmentCrossesOuterRing(p1, p2);
                 auto seg = std::make_shared<GLine>(p1, p2, FastConstruct);
-                bool validWater = hvg->polygons[pi]->isValidWaterSegment(seg);
-                bool crossHoles = hvg->polygons[pi]->segmentCrossesHoles(seg);
+                bool crossHoles = hvg->getPolygons()[pi]->segmentCrossesHoles(seg);
                 qWarning().noquote()
-                    << QString("    Poly %1: crossOuter=%2 validWater=%3 crossHoles=%4")
-                           .arg(pi).arg(crossOuter).arg(validWater).arg(crossHoles);
+                    << QString("    Poly %1: crossOuter=%2 crossHoles=%3")
+                           .arg(pi).arg(crossOuter).arg(crossHoles);
             }
 
             double midLon = (t.lon1 + t.lon2) / 2.0;
             double midLat = (t.lat1 + t.lat2) / 2.0;
             GPoint midPt{units::angle::degree_t{midLon},
                          units::angle::degree_t{midLat}};
-            for (int pi = 0; pi < hvg->polygons.size(); ++pi)
+            for (int pi = 0; pi < hvg->getPolygons().size(); ++pi)
             {
-                bool inPoly = hvg->polygons[pi]->isPointWithinPolygon(midPt);
+                bool inPoly = hvg->getPolygons()[pi]->isPointWithinPolygon(midPt);
                 if (inPoly)
                     qWarning() << "    Midpoint in polygon" << pi;
             }

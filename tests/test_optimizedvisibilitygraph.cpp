@@ -259,7 +259,7 @@ void OptimizedVisibilityGraphTest::testGetVisibleNodesWithinPolygon()
 {
     // Find containing polygon for our test point
     auto containingPolygon = visibilityGraph->findContainingPolygon(
-        visibilityGraph->polygons[0]->outer()[0]);
+        visibilityGraph->getPolygons()[0]->outer()[0]);
 
     if (containingPolygon)
     {

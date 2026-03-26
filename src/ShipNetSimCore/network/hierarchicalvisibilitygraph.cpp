@@ -29,7 +29,6 @@ bool ShortestPathResult::isValid() const
 // =============================================================================
 
 HierarchicalVisibilityGraph::HierarchicalVisibilityGraph()
-    : enableWrapAround(false)
 {}
 
 HierarchicalVisibilityGraph::HierarchicalVisibilityGraph(
@@ -419,7 +418,7 @@ HierarchicalVisibilityGraph::computeWaterArc(
     // Test which bisector points toward water
     const auto& lvl = mLevels[level];
     double cosLat = std::max(std::cos(vLat * M_PI / 180.0), 0.01);
-    double testDeg = mAvgSpacing / (111000.0 * 3.0);
+    double testDeg = mAvgSpacing / (METERS_PER_DEGREE_LAT * 3.0);
     double testLon = vLon + std::sin(bis1) * testDeg / cosLat;
     double testLat = vLat + std::cos(bis1) * testDeg;
     GPoint testPt{units::angle::degree_t{testLon},
@@ -609,7 +608,7 @@ void HierarchicalVisibilityGraph::addIntraRingExpressEdges(
     double maxSearchDeg = std::sqrt(
         std::pow(envMaxLon - envMinLon, 2)
         + std::pow(envMaxLat - envMinLat, 2)) * 0.5;
-    double initRadiusDeg = mAvgSpacing / 111000.0;
+    double initRadiusDeg = mAvgSpacing / METERS_PER_DEGREE_LAT;
 
     // Accept any vertex (intra-ring express has no ring filter)
     auto acceptAll = [](int) { return true; };
@@ -705,7 +704,7 @@ void HierarchicalVisibilityGraph::addInterRingBridges(
         lats[i] = level.vertices[i]->getLatitude().value();
     }
 
-    double initRadiusDeg = mAvgSpacing / 111000.0;
+    double initRadiusDeg = mAvgSpacing / METERS_PER_DEGREE_LAT;
     double maxSearchDeg = 90.0;  // half-globe
 
     long long edgesAdded = 0;
@@ -893,7 +892,7 @@ void HierarchicalVisibilityGraph::bridgeConnectedComponents(
         }
 
         // For each representative, bridge to a different component
-        double initR = mAvgSpacing / 111000.0;
+        double initR = mAvgSpacing / METERS_PER_DEGREE_LAT;
         int bridgesAdded = 0;
 
         for (int c = 0; c < numComponents; ++c)
@@ -955,7 +954,7 @@ void HierarchicalVisibilityGraph::addSpatialGridEdges(
     }
 
     // Build spatial grid
-    double cellSize = std::max(maxDist / (111000.0 * 10.0), 0.5);
+    double cellSize = std::max(maxDist / (METERS_PER_DEGREE_LAT * 10.0), 0.5);
     int cols = std::max(1, static_cast<int>((maxLon - minLon) / cellSize) + 1);
     int rows = std::max(1, static_cast<int>((maxLat - minLat) / cellSize) + 1);
 
@@ -982,7 +981,7 @@ void HierarchicalVisibilityGraph::addSpatialGridEdges(
     }
 
     int searchRadius = static_cast<int>(
-        std::ceil(maxDist / (111000.0 * cellSize))) + 1;
+        std::ceil(maxDist / (METERS_PER_DEGREE_LAT * cellSize))) + 1;
     int maxCross = LEVEL_MAX_CROSS_CHECKS[levelIdx];
 
     // Helper: compute octant index (0-7) for direction from vertex i to j
@@ -1490,7 +1489,6 @@ int HierarchicalVisibilityGraph::injectPointIntoLevel(
     // Connect to nearest vertices in the same polygon.
     // This gives the injected point adjacency edges so A* can
     // route through it, similar to Phase 2 spatial grid edges.
-    static constexpr int MAX_INJECT_NEIGHBORS = 8;
 
     struct Candidate { int idx; double dist; };
     std::vector<Candidate> candidates;
@@ -2180,9 +2178,9 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
         double latRad = lat * M_PI / 180.0;
         double cosLat = std::cos(latRad);
         double lonExpand = (cosLat > 1e-6)
-                               ? expansion / (111000.0 * cosLat)
+                               ? expansion / (METERS_PER_DEGREE_LAT * cosLat)
                                : 180.0;
-        double latExpand = expansion / 111000.0;
+        double latExpand = expansion / METERS_PER_DEGREE_LAT;
 
         corridor.minLon = std::min(corridor.minLon, lon - lonExpand);
         corridor.maxLon = std::max(corridor.maxLon, lon + lonExpand);
@@ -2549,7 +2547,7 @@ ShortestPathResult HierarchicalVisibilityGraph::bridgeViaDirectionalVisibility(
         // Cast a short test ray at bis1 to check if it points into water
         double cosLat  = std::cos(vLat * M_PI / 180.0);
         double safecos = std::max(cosLat, 0.01);
-        double testDeg = 100.0 / 111000.0;  // ~100 m
+        double testDeg = 100.0 / METERS_PER_DEGREE_LAT;  // ~100 m
         double testLon = vLon + std::sin(bis1) * testDeg / safecos;
         double testLat = vLat + std::cos(bis1) * testDeg;
         GPoint testPt{units::angle::degree_t{testLon},
@@ -2603,8 +2601,8 @@ ShortestPathResult HierarchicalVisibilityGraph::bridgeViaDirectionalVisibility(
         double halfAngle = 15.0 * M_PI / 180.0;
 
         // Single quadtree query for the search radius bounding box
-        double rDegLat = searchRadius / 111000.0;
-        double rDegLon = searchRadius / (111000.0 * safecos);
+        double rDegLat = searchRadius / METERS_PER_DEGREE_LAT;
+        double rDegLon = searchRadius / (METERS_PER_DEGREE_LAT * safecos);
         QRectF sectorBbox(vLon - rDegLon, vLat - rDegLat,
                           2.0 * rDegLon, 2.0 * rDegLat);
         auto candidates = lvl.quadtree->findVerticesInRange(sectorBbox);
@@ -2865,7 +2863,7 @@ bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
     {
         // Build a fast GLine for polygon water-segment check
         auto segLine = std::make_shared<GLine>(startPt, endPt, FastConstruct);
-        if (!commonPolygon->isValidWaterSegment(segLine))
+        if (commonPolygon->segmentCrossesHoles(segLine))
             return false;
 
         // Verify midpoint is inside the water polygon — prevents
@@ -3009,7 +3007,7 @@ bool HierarchicalVisibilityGraph::isSegmentVisibleImpl(
                 || edgeMaxLat < segMinLat || edgeMinLat > segMaxLat)
                 return false;
 
-            const double COORD_TOL = 0.00001;
+            const double COORD_TOL = SIMPLIFIED_COORD_TOL;
             auto coordsNear = [COORD_TOL](double lon1, double lat1,
                                            double lon2, double lat2) {
                 return std::abs(lon1 - lon2) < COORD_TOL
@@ -3231,9 +3229,10 @@ HierarchicalVisibilityGraph::getVisibleNodesWithinPolygon(
                      [&node](const auto& p) { return *p != *node; });
     }
 
-    // Distance-sorted visibility with caps: check 500 nearest, stop at 20
-    auto visibleNodes = findNearestVisibleNodes(node, candidates, 0,
-                                                500, 20);
+    // Distance-sorted visibility with caps
+    auto visibleNodes = findNearestVisibleNodes(
+        node, candidates, 0,
+        ON_DEMAND_MAX_CHECK, ON_DEMAND_MAX_FOUND);
 
     // Add manual connections
     {
@@ -3286,8 +3285,9 @@ HierarchicalVisibilityGraph::getVisibleNodesBetweenPolygons(
         }
     }
 
-    // Distance-sorted visibility with caps: check 100 nearest, stop at 10
-    auto visibleNodes = findNearestVisibleNodes(node, tasks, 0, 500, 20);
+    // Distance-sorted visibility with caps
+    auto visibleNodes = findNearestVisibleNodes(
+        node, tasks, 0, ON_DEMAND_MAX_CHECK, ON_DEMAND_MAX_FOUND);
 
     QReadLocker locker(&mManualLock);
     auto it = manualConnections.find(node);

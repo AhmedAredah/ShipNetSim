@@ -422,14 +422,6 @@ public:
      * @brief Check if a segment is valid for water navigation.
      *
      * For water polygons (where holes represent land/islands), this
-     * checks that a segment doesn't create invalid paths through holes.
-     *
-     * @param segment The segment to validate
-     * @return true if segment doesn't pass through holes
-     */
-    bool isValidWaterSegment(const std::shared_ptr<GLine> &segment) const;
-
-    /**
      * @brief Check if a segment crosses through any holes.
      *
      * @param segment The segment to check

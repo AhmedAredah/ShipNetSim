@@ -89,11 +89,6 @@ constexpr double VERTEX_TOLERANCE_METERS = 0.1;
 constexpr int HOLE_SAMPLING_COUNT = 10;
 
 /**
- * @brief Threshold for short segment detection in meters.
- */
-constexpr double SHORT_SEGMENT_THRESHOLD_METERS = 1000.0;
-
-/**
  * @brief Threshold for detecting large longitude jumps (antimeridian crossing).
  */
 constexpr double LONGITUDE_JUMP_THRESHOLD = 180.0;
@@ -785,11 +780,6 @@ bool Polygon::intersects(const std::shared_ptr<GLine> line)
 
     delete intersection;
     return result;
-}
-
-bool Polygon::isValidWaterSegment(const std::shared_ptr<GLine> &segment) const
-{
-    return !isSegmentDiagonalThroughHole(segment);
 }
 
 bool Polygon::segmentCrossesHoles(const std::shared_ptr<GLine> &segment) const

@@ -187,18 +187,9 @@ public:
     /** @brief Read-only access to a graph level for diagnostics/export. */
     const GraphLevel& getLevel(int idx) const { return mLevels[idx]; }
 
-    bool enableWrapAround;
-
-    std::unordered_set<std::shared_ptr<GLine>, GLine::Hash, GLine::Equal>
-        manualLinesSet;
-    std::unordered_map<std::shared_ptr<GPoint>,
-        QVector<std::shared_ptr<GPoint>>,
-        GPoint::Hash, GPoint::Equal> manualConnections;
-    QVector<std::shared_ptr<GPoint>> manualPoints;
-    std::unordered_set<std::shared_ptr<GPoint>,
-        GPoint::Hash, GPoint::Equal> manualPointsSet;
-
-    QVector<std::shared_ptr<Polygon>> polygons;
+    /** @brief Read-only access to the polygon list. */
+    const QVector<std::shared_ptr<Polygon>>& getPolygons() const
+    { return polygons; }
 
     std::shared_ptr<Polygon>
     findContainingPolygon(const std::shared_ptr<GPoint>& point) const;
@@ -226,8 +217,30 @@ private:
 
     mutable QReadWriteLock mManualLock;
 
+    // ----- Encapsulated data (formerly public) -----
+    bool enableWrapAround = false;
+
+    std::unordered_set<std::shared_ptr<GLine>, GLine::Hash, GLine::Equal>
+        manualLinesSet;
+    std::unordered_map<std::shared_ptr<GPoint>,
+        QVector<std::shared_ptr<GPoint>>,
+        GPoint::Hash, GPoint::Equal> manualConnections;
+    QVector<std::shared_ptr<GPoint>> manualPoints;
+    std::unordered_set<std::shared_ptr<GPoint>,
+        GPoint::Hash, GPoint::Equal> manualPointsSet;
+
+    QVector<std::shared_ptr<Polygon>> polygons;
+
+    // ----- Physical / geometric constants -----
+    static constexpr double METERS_PER_DEGREE_LAT = 111000.0;
     static constexpr double PORTAL_ZONE_DEGREES = 30.0;
     static constexpr double PORTAL_LAT_TOLERANCE = 10.0;
+
+    // ----- Algorithm constants -----
+    static constexpr int MAX_INJECT_NEIGHBORS = 8;
+    static constexpr int ON_DEMAND_MAX_CHECK = 500;
+    static constexpr int ON_DEMAND_MAX_FOUND = 20;
+    static constexpr double SIMPLIFIED_COORD_TOL = 0.00001;
 
     // =============================================================
     // Data Resolution Parameters — scale with input vertex spacing

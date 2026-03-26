@@ -259,7 +259,7 @@ void HierarchicalVisibilityGraphTest::testVisibilityWithinPolygon()
     // Test visibility between points within the same polygon
     // by checking that polygon vertices are visible to a test point
     auto containingPolygon = visibilityGraph->findContainingPolygon(
-        visibilityGraph->polygons[0]->outer()[0]);
+        visibilityGraph->getPolygons()[0]->outer()[0]);
 
     if (containingPolygon)
     {
@@ -303,7 +303,7 @@ void HierarchicalVisibilityGraphTest::
 
     // Test visibility from the outside point to polygon vertices
     int visibleCount = 0;
-    auto outerRing = visibilityGraph->polygons[0]->outer();
+    auto outerRing = visibilityGraph->getPolygons()[0]->outer();
     for (int i = 0; i < outerRing.size() - 1 && i < 10; ++i)
     {
         bool vis = visibilityGraph->isVisible(
