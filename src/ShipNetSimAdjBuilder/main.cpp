@@ -1,11 +1,9 @@
-#include "network/gpoint.h"
 #include "network/hierarchicalvisibilitygraph.h"
 #include "network/polygon.h"
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <gdal_priv.h>
-#include <ogrsf_frmts.h>
 #include <iostream>
 #include <memory>
 
@@ -14,122 +12,7 @@ using namespace ShipNetSimCore;
 static QVector<std::shared_ptr<Polygon>>
 loadPolygonsFromShapefile(const QString& filepath)
 {
-    QVector<std::shared_ptr<Polygon>> polygons;
-
-    GDALDataset* poDS = static_cast<GDALDataset*>(
-        GDALOpenEx(filepath.toStdString().c_str(), GDAL_OF_VECTOR,
-                   nullptr, nullptr, nullptr));
-    if (!poDS)
-    {
-        std::cerr << "Error: Failed to open shapefile: "
-                  << filepath.toStdString() << "\n";
-        return polygons;
-    }
-
-    OGRLayer* poLayer = poDS->GetLayer(0);
-    if (!poLayer)
-    {
-        std::cerr << "Error: No layers found in shapefile.\n";
-        GDALClose(poDS);
-        return polygons;
-    }
-
-    // Validate WGS84 CRS
-    const OGRSpatialReference* poSRS = poLayer->GetSpatialRef();
-    if (poSRS)
-    {
-        OGRSpatialReference wgs84SRS;
-        wgs84SRS.SetWellKnownGeogCS("WGS84");
-        if (!poSRS->IsSameGeogCS(&wgs84SRS))
-        {
-            std::cerr << "Warning: Shapefile CRS is not WGS84. "
-                      << "Results may be incorrect.\n";
-        }
-    }
-    else
-    {
-        std::cerr << "Warning: No spatial reference found.\n";
-    }
-
-    poLayer->ResetReading();
-
-    int shapeID = 0;
-
-    // Process a single OGRPolygon into a Polygon and append to result
-    auto processOGRPolygon = [&](OGRPolygon* poPolygon) {
-        OGRLinearRing* poExteriorRing = poPolygon->getExteriorRing();
-
-        QVector<std::shared_ptr<GPoint>> exteriorRing;
-        if (poExteriorRing != nullptr)
-        {
-            int nPoints = poExteriorRing->getNumPoints();
-            for (int i = 0; i < nPoints; i++)
-            {
-                double x = poExteriorRing->getX(i);
-                double y = poExteriorRing->getY(i);
-                exteriorRing.push_back(
-                    std::make_shared<GPoint>(
-                        units::angle::degree_t(x),
-                        units::angle::degree_t(y)));
-            }
-            shapeID++;
-        }
-
-        int nInteriorRings = poPolygon->getNumInteriorRings();
-        QVector<QVector<std::shared_ptr<GPoint>>> innerHoles(
-            nInteriorRings);
-
-        for (int i = 0; i < nInteriorRings; i++)
-        {
-            OGRLinearRing* poInteriorRing =
-                poPolygon->getInteriorRing(i);
-            int nPoints = poInteriorRing->getNumPoints();
-            for (int j = 0; j < nPoints; j++)
-            {
-                double x = poInteriorRing->getX(j);
-                double y = poInteriorRing->getY(j);
-                innerHoles[i].push_back(
-                    std::make_shared<GPoint>(
-                        units::angle::degree_t(x),
-                        units::angle::degree_t(y)));
-            }
-        }
-
-        auto polygon = std::make_shared<Polygon>(
-            exteriorRing, innerHoles,
-            QString::number(shapeID));
-        polygons.push_back(polygon);
-    };
-
-    OGRFeature* poFeature;
-    while ((poFeature = poLayer->GetNextFeature()) != nullptr)
-    {
-        OGRGeometry* poGeometry = poFeature->GetGeometryRef();
-        if (poGeometry != nullptr)
-        {
-            auto geomType = wkbFlatten(poGeometry->getGeometryType());
-
-            if (geomType == wkbPolygon)
-            {
-                processOGRPolygon(
-                    static_cast<OGRPolygon*>(poGeometry));
-            }
-            else if (geomType == wkbMultiPolygon)
-            {
-                OGRMultiPolygon* poMulti =
-                    static_cast<OGRMultiPolygon*>(poGeometry);
-                for (int g = 0; g < poMulti->getNumGeometries(); g++)
-                {
-                    processOGRPolygon(static_cast<OGRPolygon*>(
-                        poMulti->getGeometryRef(g)));
-                }
-            }
-        }
-        OGRFeature::DestroyFeature(poFeature);
-    }
-
-    GDALClose(poDS);
-    return polygons;
+    return Polygon::loadFromShapefile(filepath);
 }
 
 int main(int argc, char* argv[])
@@ -196,10 +79,9 @@ int main(int argc, char* argv[])
     std::cout << "      Loaded " << polygons.size() << " polygons in "
               << loadTime << "s\n\n";
 
-    // Step 2: Build HierarchicalVisibilityGraph (builds all 4 levels,
-    //         adjacency for levels 1-3)
+    // Step 2: Build HierarchicalVisibilityGraph (vertices + quadtrees)
     std::cout << "[2/4] Building HierarchicalVisibilityGraph "
-              << "(levels 0-3)...\n";
+              << "(vertices + quadtrees)...\n";
     timer.restart();
 
     auto hvg = std::make_shared<HierarchicalVisibilityGraph>(
@@ -208,20 +90,19 @@ int main(int argc, char* argv[])
     double hvgTime = timer.elapsed() / 1000.0;
     std::cout << "      HVG built in " << hvgTime << "s\n\n";
 
-    // Step 3: Build Level 0 adjacency (synchronous - this is what
-    //         crashes in the main app)
-    std::cout << "[3/4] Building Level 0 adjacency "
-              << "(this may take a while)...\n";
+    // Step 3: Build all adjacency (L1-L3 coarse + L0 fine)
+    std::cout << "[3/4] Building all adjacency (L0-L3, "
+              << "this may take a while)...\n";
     timer.restart();
 
-    hvg->buildLevel0Adjacency();
+    hvg->buildAllAdjacency();
 
     double adjTime = timer.elapsed() / 1000.0;
-    std::cout << "      Level 0 adjacency built in " << adjTime
+    std::cout << "      All adjacency built in " << adjTime
               << "s\n\n";
 
-    // Step 4: Save adjacency cache
-    std::cout << "[4/4] Saving adjacency cache...\n";
+    // Step 4: Save multi-level adjacency cache
+    std::cout << "[4/4] Saving adjacency cache (all levels)...\n";
     timer.restart();
 
     bool saved = hvg->saveAdjacencyCache(outputPath);
