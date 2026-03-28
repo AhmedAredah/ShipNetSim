@@ -25,6 +25,7 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <ogrsf_frmts.h>
 
 namespace ShipNetSimCore
 {
@@ -115,6 +116,114 @@ Polygon::Polygon(const QVector<std::shared_ptr<GPoint>>          &boundary,
 {
     setOuterPoints(boundary);
     setInnerHolesPoints(holes);
+}
+
+// =============================================================================
+// Static Shapefile Loading
+// =============================================================================
+
+QVector<std::shared_ptr<Polygon>>
+Polygon::loadFromShapefile(const QString& filepath)
+{
+    QVector<std::shared_ptr<Polygon>> polygons;
+
+    GDALDataset* poDS = static_cast<GDALDataset*>(
+        GDALOpenEx(filepath.toStdString().c_str(), GDAL_OF_VECTOR,
+                   nullptr, nullptr, nullptr));
+    if (!poDS)
+    {
+        qWarning() << "Polygon::loadFromShapefile: Failed to open"
+                   << filepath;
+        return polygons;
+    }
+
+    OGRLayer* poLayer = poDS->GetLayer(0);
+    if (!poLayer)
+    {
+        qWarning() << "Polygon::loadFromShapefile: No layers found";
+        GDALClose(poDS);
+        return polygons;
+    }
+
+    const OGRSpatialReference* poSRS = poLayer->GetSpatialRef();
+    if (poSRS)
+    {
+        OGRSpatialReference wgs84SRS;
+        wgs84SRS.SetWellKnownGeogCS("WGS84");
+        if (!poSRS->IsSameGeogCS(&wgs84SRS))
+        {
+            qWarning() << "Polygon::loadFromShapefile:"
+                       << "CRS is not WGS84 — results may be incorrect";
+        }
+    }
+
+    poLayer->ResetReading();
+    int shapeID = 0;
+
+    auto processOGRPolygon = [&](OGRPolygon* poPolygon) {
+        OGRLinearRing* poExteriorRing = poPolygon->getExteriorRing();
+
+        QVector<std::shared_ptr<GPoint>> exteriorRing;
+        if (poExteriorRing)
+        {
+            int nPoints = poExteriorRing->getNumPoints();
+            for (int i = 0; i < nPoints; i++)
+            {
+                exteriorRing.push_back(
+                    std::make_shared<GPoint>(
+                        units::angle::degree_t(poExteriorRing->getX(i)),
+                        units::angle::degree_t(poExteriorRing->getY(i))));
+            }
+            shapeID++;
+        }
+
+        int nInteriorRings = poPolygon->getNumInteriorRings();
+        QVector<QVector<std::shared_ptr<GPoint>>> innerHoles(nInteriorRings);
+
+        for (int i = 0; i < nInteriorRings; i++)
+        {
+            OGRLinearRing* poInteriorRing = poPolygon->getInteriorRing(i);
+            int nPoints = poInteriorRing->getNumPoints();
+            for (int j = 0; j < nPoints; j++)
+            {
+                innerHoles[i].push_back(
+                    std::make_shared<GPoint>(
+                        units::angle::degree_t(poInteriorRing->getX(j)),
+                        units::angle::degree_t(poInteriorRing->getY(j))));
+            }
+        }
+
+        polygons.push_back(std::make_shared<Polygon>(
+            exteriorRing, innerHoles, QString::number(shapeID)));
+    };
+
+    OGRFeature* poFeature;
+    while ((poFeature = poLayer->GetNextFeature()) != nullptr)
+    {
+        OGRGeometry* poGeometry = poFeature->GetGeometryRef();
+        if (poGeometry)
+        {
+            auto geomType = wkbFlatten(poGeometry->getGeometryType());
+            if (geomType == wkbPolygon)
+            {
+                processOGRPolygon(static_cast<OGRPolygon*>(poGeometry));
+            }
+            else if (geomType == wkbMultiPolygon)
+            {
+                OGRMultiPolygon* poMulti =
+                    static_cast<OGRMultiPolygon*>(poGeometry);
+                for (int g = 0; g < poMulti->getNumGeometries(); g++)
+                {
+                    processOGRPolygon(static_cast<OGRPolygon*>(
+                        poMulti->getGeometryRef(g)));
+                }
+            }
+        }
+        OGRFeature::DestroyFeature(poFeature);
+    }
+
+    GDALClose(poDS);
+    return polygons;
 }
 
 // =============================================================================

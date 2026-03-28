@@ -274,6 +274,19 @@ public:
             const QVector<QVector<std::shared_ptr<GPoint>>> &holes = {},
             const QString                                    ID    = "");
 
+    /**
+     * @brief Load polygons from an OGR-compatible shapefile.
+     *
+     * Single source of truth for polygon loading — used by both
+     * OptimizedNetwork and ShipNetSimAdjBuilder to ensure identical
+     * polygon data and consistent simplification results.
+     *
+     * @param filepath Path to the shapefile (.shp)
+     * @return Vector of polygons (empty on failure)
+     */
+    static QVector<std::shared_ptr<Polygon>>
+    loadFromShapefile(const QString& filepath);
+
     // =========================================================================
     // Boundary Accessors and Mutators
     // =========================================================================
