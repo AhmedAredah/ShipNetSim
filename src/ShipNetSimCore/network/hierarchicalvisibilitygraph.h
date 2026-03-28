@@ -43,6 +43,7 @@ struct HVGDiagnostics
     };
     std::array<LevelInfo, 4> levels;
     bool level0AdjReady = false;
+    bool coarseAdjReady = false;
     int polygonGraphPolygonCount = 0;
 };
 
@@ -178,6 +179,7 @@ public:
 
     void buildLevel0Adjacency();
     void buildLevel0AdjacencyAsync(const QString& cachePath = QString());
+    void buildAllAdjacency();
     bool saveAdjacencyCache(const QString& filePath) const;
     bool loadAdjacencyCache(const QString& filePath);
 
@@ -213,6 +215,7 @@ private:
     PolygonGraph mPolygonGraph;
 
     std::atomic<bool> mLevel0AdjReady{false};
+    bool mCoarseAdjReady = false;   ///< true when L1-L3 adjacency available
     QString mLevel0CachePath;
 
     mutable QReadWriteLock mManualLock;
@@ -294,9 +297,15 @@ private:
     /** @brief Compute dynamic level parameters from polygon vertex spacing. */
     void computeDynamicParameters();
 
-    void buildAllLevels();
+    void buildAllLevelVertices();
+    void buildCoarseLevelAdjacency();
+    void ensureCoarseAdjacency();
     void buildLevel(int idx);
     void buildAdjacencyForLevel(int idx);
+
+    // ----- Cache serialization helpers -----
+    bool writeLevelAdjacency(QDataStream& out, int level) const;
+    bool readLevelAdjacency(QDataStream& in, int level);
 
     // -----------------------------------------------------------------
     // Phase-based adjacency construction helpers

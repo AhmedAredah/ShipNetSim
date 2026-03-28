@@ -1,6 +1,5 @@
 #include "hierarchicalvisibilitygraph.h"
 #include "../utils/utils.h"
-#include <QCryptographicHash>
 #include <QDataStream>
 #include <QElapsedTimer>
 #include <QFile>
@@ -61,7 +60,8 @@ HierarchicalVisibilityGraph::HierarchicalVisibilityGraph(
     }
 
     computeDynamicParameters();
-    buildAllLevels();
+    buildAllLevelVertices();
+    buildPolygonGraph();
 }
 
 // =============================================================================
@@ -124,12 +124,15 @@ HierarchicalVisibilityGraph::~HierarchicalVisibilityGraph()
 // Level Building
 // =============================================================================
 
-void HierarchicalVisibilityGraph::buildAllLevels()
+void HierarchicalVisibilityGraph::buildAllLevelVertices()
 {
     for (int i = 0; i < NUM_LEVELS; ++i)
-    {
         buildLevel(i);
-    }
+}
+
+void HierarchicalVisibilityGraph::buildCoarseLevelAdjacency()
+{
+    if (mCoarseAdjReady) return;
 
     // Build adjacency for coarser levels (1-3) sequentially.
     // OGRSpatialReference / PROJ is NOT thread-safe for concurrent access
@@ -137,8 +140,22 @@ void HierarchicalVisibilityGraph::buildAllLevels()
     for (int i = 1; i < NUM_LEVELS; ++i)
         buildAdjacencyForLevel(i);
 
-    // Build polygon-level graph for instant L3 coarse routing
-    buildPolygonGraph();
+    mCoarseAdjReady = true;
+}
+
+void HierarchicalVisibilityGraph::ensureCoarseAdjacency()
+{
+    if (!mCoarseAdjReady)
+    {
+        qInfo() << "L1-L3 adjacency not in cache; building from scratch...";
+        buildCoarseLevelAdjacency();
+    }
+}
+
+void HierarchicalVisibilityGraph::buildAllAdjacency()
+{
+    buildCoarseLevelAdjacency();
+    buildLevel0Adjacency();
 }
 
 void HierarchicalVisibilityGraph::buildLevel(int idx)
@@ -1750,20 +1767,22 @@ ShortestPathResult HierarchicalVisibilityGraph::searchAtLevel(
 
     while (!openSet.empty())
     {
+        // Budget check every iteration — individual expansions may be
+        // expensive (e.g. connectWrapAroundPoints near antimeridian),
+        // so checking only every 64th iteration can cause multi-hour hangs.
+        if (maxExpansions > 0 && expandedCount > maxExpansions)
+        {
+            qDebug() << "searchAtLevel" << level
+                     << ": expansion budget exceeded"
+                     << expandedCount << ">" << maxExpansions;
+            return ShortestPathResult();
+        }
+
         if (++iterationCount % 64 == 0)
         {
             if (QThread::currentThread()->isInterruptionRequested())
             {
                 qWarning() << "Search cancelled by thread interruption";
-                return ShortestPathResult();
-            }
-
-            // Expansion budget check
-            if (maxExpansions > 0 && expandedCount > maxExpansions)
-            {
-                qDebug() << "searchAtLevel" << level
-                         << ": expansion budget exceeded"
-                         << expandedCount << ">" << maxExpansions;
                 return ShortestPathResult();
             }
 
@@ -1797,11 +1816,13 @@ ShortestPathResult HierarchicalVisibilityGraph::searchAtLevel(
             neighbors.append(endNav);
         }
 
-        // Wrap-around connections
-        if (enableWrapAround && level == 0)
-        {
-            neighbors.append(connectWrapAroundPoints(current, endNav));
-        }
+        // Wrap-around connections disabled in A* loop.
+        // Cached L0 adjacency handles antimeridian via:
+        //   Phase 1 boundary edges (consecutive ring vertices cross ±180°)
+        //   Phase 2/3 connectOctantNearest (antimeridian-wrapped queries)
+        // On-demand connectWrapAroundPoints calls getVisibleNodesWithinPolygon
+        // (O(N) per near-boundary vertex), causing multi-hour hangs on
+        // trans-Pacific routes like Yokohama→LongBeach.
 
         for (const auto& neighbor : neighbors)
         {
@@ -1870,6 +1891,8 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal)
 {
+    ensureCoarseAdjacency();
+
     QElapsedTimer hsTimer;
     hsTimer.start();
     qDebug() << "=== Hierarchical Search ===";
@@ -3636,6 +3659,7 @@ GPoint HierarchicalVisibilityGraph::getMaxMapPoint()
 void HierarchicalVisibilityGraph::clear()
 {
     mLevel0AdjReady.store(false, std::memory_order_release);
+    mCoarseAdjReady = false;
 
     // Clear vertex ownership and visibility cache for ALL levels
     // (includes simplified vertices at L1-L3 that have ownership set)
@@ -3687,6 +3711,7 @@ void HierarchicalVisibilityGraph::setPolygons(
     const QVector<std::shared_ptr<Polygon>>& newPolygons)
 {
     mLevel0AdjReady.store(false, std::memory_order_release);
+    mCoarseAdjReady = false;
 
     // Clear ownership from ALL level vertices (including simplified)
     for (int i = 0; i < NUM_LEVELS; ++i)
@@ -3744,11 +3769,12 @@ void HierarchicalVisibilityGraph::setPolygons(
     }
 
     computeDynamicParameters();
-    buildAllLevels();
+    buildAllLevelVertices();
+    buildPolygonGraph();
 }
 
 // =============================================================================
-// Level 0 Adjacency Cache
+// Adjacency Cache (L0-L3)
 // =============================================================================
 
 void HierarchicalVisibilityGraph::buildLevel0Adjacency()
@@ -3767,18 +3793,111 @@ void HierarchicalVisibilityGraph::buildLevel0AdjacencyAsync(
         saveAdjacencyCache(mLevel0CachePath);
 }
 
+// -----------------------------------------------------------------------------
+// Cache serialization helpers
+// -----------------------------------------------------------------------------
+
+bool HierarchicalVisibilityGraph::writeLevelAdjacency(
+    QDataStream& out, int level) const
+{
+    const auto& lvl = mLevels[level];
+    qint32 n = static_cast<qint32>(lvl.vertices.size());
+    out << n;
+
+    // Write vertex coordinates (used to rebuild vertices at load time,
+    // bypassing GEOS SimplifyPreserveTopology non-determinism)
+    for (int i = 0; i < n; ++i)
+    {
+        double lon = lvl.vertices[i]->getLongitude().value();
+        double lat = lvl.vertices[i]->getLatitude().value();
+        out << lon << lat;
+    }
+
+    qint64 edgeCount = 0;
+    for (const auto& adj : lvl.adjacency)
+        edgeCount += adj.size();
+    out << edgeCount;
+
+    for (int i = 0; i < n; ++i)
+    {
+        qint32 nc = static_cast<qint32>(lvl.adjacency[i].size());
+        out << nc;
+        for (int neighbor : lvl.adjacency[i])
+            out << static_cast<qint32>(neighbor);
+    }
+    return true;
+}
+
+bool HierarchicalVisibilityGraph::readLevelAdjacency(
+    QDataStream& in, int level)
+{
+    auto& lvl = mLevels[level];
+
+    qint32 vertexCount;
+    in >> vertexCount;
+    if (vertexCount <= 0) return false;
+
+    // Read cached vertex coordinates and rebuild level vertices.
+    // This bypasses GEOS SimplifyPreserveTopology non-determinism —
+    // the runtime uses the exact vertices the adjacency was built for.
+    QVector<std::shared_ptr<GPoint>> cachedVertices;
+    cachedVertices.reserve(vertexCount);
+    for (int i = 0; i < vertexCount; ++i)
+    {
+        double lon, lat;
+        in >> lon >> lat;
+        cachedVertices.append(std::make_shared<GPoint>(
+            units::angle::degree_t(lon), units::angle::degree_t(lat)));
+    }
+
+    // Read adjacency
+    qint64 expectedEdges;
+    in >> expectedEdges;
+
+    std::vector<std::vector<int>> adjacency(vertexCount);
+    qint64 actualEdges = 0;
+    for (int i = 0; i < vertexCount; ++i)
+    {
+        qint32 nc;
+        in >> nc;
+        if (nc < 0 || nc > vertexCount)
+            return false;
+        adjacency[i].resize(nc);
+        actualEdges += nc;
+        for (int j = 0; j < nc; ++j)
+        {
+            qint32 idx;
+            in >> idx;
+            if (idx < 0 || idx >= vertexCount)
+                return false;
+            adjacency[i][j] = idx;
+        }
+    }
+    if (actualEdges != expectedEdges)
+        return false;
+
+    // Override level data with cached vertices + adjacency
+    lvl.vertices = cachedVertices;
+    lvl.vertexIndex.clear();
+    for (int i = 0; i < vertexCount; ++i)
+        lvl.vertexIndex[cachedVertices[i]] = i;
+    lvl.adjacency = std::move(adjacency);
+
+    // Clear quadtree to force buildCorridor's linear-scan fallback
+    // (line 2280-2306). This ensures corridor uses cached vertices,
+    // not runtime-simplified vertices that may differ from cache.
+    lvl.quadtree.reset();
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Save / Load
+// -----------------------------------------------------------------------------
+
 bool HierarchicalVisibilityGraph::saveAdjacencyCache(
     const QString& filePath) const
 {
-    const auto& lvl = mLevels[0];
-    int n = lvl.vertices.size();
-
-    if (n == 0 || lvl.adjacency.empty())
-    {
-        qWarning() << "saveAdjacencyCache: No Level 0 adjacency to save";
-        return false;
-    }
-
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
     {
@@ -3790,56 +3909,37 @@ bool HierarchicalVisibilityGraph::saveAdjacencyCache(
     out.setByteOrder(QDataStream::LittleEndian);
     out.setFloatingPointPrecision(QDataStream::DoublePrecision);
 
-    // Magic bytes "HVG0"
     out.writeRawData("HVG0", 4);
-
-    // Version
     qint32 version = 1;
     out << version;
+    qint32 levelCount = NUM_LEVELS;
+    out << levelCount;
 
-    // Vertex count
-    qint32 vertexCount = static_cast<qint32>(n);
-    out << vertexCount;
-
-    // SHA-256 of vertex coordinates
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    for (int i = 0; i < n; ++i)
+    int savedCount = 0;
+    for (int i = 0; i < NUM_LEVELS; ++i)
     {
-        double lon = lvl.vertices[i]->getLongitude().value();
-        double lat = lvl.vertices[i]->getLatitude().value();
-        hash.addData(reinterpret_cast<const char*>(&lon), sizeof(double));
-        hash.addData(reinterpret_cast<const char*>(&lat), sizeof(double));
-    }
-    QByteArray coordHash = hash.result();
-    out.writeRawData(coordHash.constData(), 32);
-
-    // Write adjacency lists
-    for (int i = 0; i < n; ++i)
-    {
-        qint32 neighborCount = static_cast<qint32>(lvl.adjacency[i].size());
-        out << neighborCount;
-        for (int neighbor : lvl.adjacency[i])
+        bool present = !mLevels[i].adjacency.empty()
+                       && !mLevels[i].vertices.isEmpty();
+        out << static_cast<qint8>(present ? 1 : 0);
+        if (present)
         {
-            qint32 idx = static_cast<qint32>(neighbor);
-            out << idx;
+            writeLevelAdjacency(out, i);
+            ++savedCount;
         }
     }
 
     file.close();
-    qDebug() << "Saved Level 0 adjacency cache to" << filePath
-             << "(" << file.size() << "bytes)";
+    qDebug() << "Saved" << savedCount << "level(s) adjacency cache to"
+             << filePath << "(" << file.size() << "bytes)";
     return true;
 }
 
 bool HierarchicalVisibilityGraph::loadAdjacencyCache(
     const QString& filePath)
 {
-    auto& lvl = mLevels[0];
-    int n = lvl.vertices.size();
-
-    if (n == 0)
+    if (mLevels[0].vertices.isEmpty())
     {
-        qWarning() << "loadAdjacencyCache: No Level 0 vertices";
+        qWarning() << "loadAdjacencyCache: No vertices built yet";
         return false;
     }
 
@@ -3854,7 +3954,6 @@ bool HierarchicalVisibilityGraph::loadAdjacencyCache(
     in.setByteOrder(QDataStream::LittleEndian);
     in.setFloatingPointPrecision(QDataStream::DoublePrecision);
 
-    // Validate magic
     char magic[4];
     if (in.readRawData(magic, 4) != 4 ||
         memcmp(magic, "HVG0", 4) != 0)
@@ -3863,79 +3962,51 @@ bool HierarchicalVisibilityGraph::loadAdjacencyCache(
         return false;
     }
 
-    // Validate version
     qint32 version;
     in >> version;
+
     if (version != 1)
     {
         qWarning() << "loadAdjacencyCache: Unsupported version" << version;
         return false;
     }
 
-    // Validate vertex count
-    qint32 vertexCount;
-    in >> vertexCount;
-    if (vertexCount != static_cast<qint32>(n))
-    {
-        qDebug() << "loadAdjacencyCache: Vertex count mismatch"
-                 << "(cache:" << vertexCount << "current:" << n << ")";
-        return false;
-    }
+    qint32 levelCount;
+    in >> levelCount;
 
-    // Validate coordinate hash
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    for (int i = 0; i < n; ++i)
+    bool allCoarseLoaded = true;
+    for (int i = 0; i < levelCount && i < NUM_LEVELS; ++i)
     {
-        double lon = lvl.vertices[i]->getLongitude().value();
-        double lat = lvl.vertices[i]->getLatitude().value();
-        hash.addData(reinterpret_cast<const char*>(&lon), sizeof(double));
-        hash.addData(reinterpret_cast<const char*>(&lat), sizeof(double));
-    }
-    QByteArray expectedHash = hash.result();
-
-    char storedHash[32];
-    if (in.readRawData(storedHash, 32) != 32 ||
-        memcmp(storedHash, expectedHash.constData(), 32) != 0)
-    {
-        qDebug() << "loadAdjacencyCache: Coordinate hash mismatch "
-                    "(shapefile changed)";
-        return false;
-    }
-
-    // Read adjacency lists
-    lvl.adjacency.resize(n);
-    for (int i = 0; i < n; ++i)
-    {
-        qint32 neighborCount;
-        in >> neighborCount;
-        if (neighborCount < 0 || neighborCount > n)
+        qint8 present;
+        in >> present;
+        if (!present)
         {
-            qWarning() << "loadAdjacencyCache: Invalid neighbor count"
-                       << neighborCount << "at vertex" << i;
-            lvl.adjacency.clear();
-            return false;
+            if (i > 0) allCoarseLoaded = false;
+            continue;
         }
-        lvl.adjacency[i].resize(neighborCount);
-        for (int j = 0; j < neighborCount; ++j)
+
+        if (readLevelAdjacency(in, i))
         {
-            qint32 idx;
-            in >> idx;
-            if (idx < 0 || idx >= n)
-            {
-                qWarning() << "loadAdjacencyCache: Invalid neighbor index"
-                           << idx << "at vertex" << i;
-                lvl.adjacency.clear();
-                return false;
-            }
-            lvl.adjacency[i][j] = idx;
+            if (i == 0)
+                mLevel0AdjReady.store(true, std::memory_order_release);
+            qDebug() << "  Loaded L" << i << "adjacency from cache"
+                     << "(" << mLevels[i].vertices.size() << "vertices,"
+                     << mLevels[i].adjacency.size() << "adj lists)";
+        }
+        else
+        {
+            qWarning() << "  Failed to load L" << i << "from cache";
+            if (i > 0) allCoarseLoaded = false;
+            break;
         }
     }
 
+    mCoarseAdjReady = allCoarseLoaded;
     file.close();
-    mLevel0AdjReady.store(true, std::memory_order_release);
-    qDebug() << "Loaded Level 0 adjacency cache from" << filePath
-             << "(" << n << "vertices)";
-    return true;
+    qDebug() << "loadAdjacencyCache: L0="
+             << mLevel0AdjReady.load(std::memory_order_acquire)
+             << "coarse=" << mCoarseAdjReady;
+    return mLevel0AdjReady.load(std::memory_order_acquire);
 }
 
 // =============================================================================
@@ -3990,6 +4061,7 @@ HVGDiagnostics HierarchicalVisibilityGraph::getDiagnostics() const
     }
     diag.level0AdjReady =
         mLevel0AdjReady.load(std::memory_order_acquire);
+    diag.coarseAdjReady = mCoarseAdjReady;
     diag.polygonGraphPolygonCount = mPolygonGraph.numPolygons;
     return diag;
 }
