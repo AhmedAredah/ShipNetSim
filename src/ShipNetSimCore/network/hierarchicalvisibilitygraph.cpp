@@ -3883,10 +3883,15 @@ bool HierarchicalVisibilityGraph::readLevelAdjacency(
         lvl.vertexIndex[cachedVertices[i]] = i;
     lvl.adjacency = std::move(adjacency);
 
-    // Clear quadtree to force buildCorridor's linear-scan fallback
-    // (line 2280-2306). This ensures corridor uses cached vertices,
-    // not runtime-simplified vertices that may differ from cache.
-    lvl.quadtree.reset();
+    // Clear quadtree for L1-L3 to force buildCorridor's linear-scan
+    // fallback (line 2280-2306). This ensures corridor uses cached
+    // vertices, not runtime-simplified vertices that may differ from
+    // cache. L0 quadtree is preserved — L0 uses original polygons
+    // (no GEOS simplification), so quadtree and cached vertices are
+    // always consistent. L0 quadtree is required by snapToWater,
+    // loadSeaPortsPolygonCoordinates, isSegmentVisibleImpl, etc.
+    if (level > 0)
+        lvl.quadtree.reset();
 
     return true;
 }
