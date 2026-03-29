@@ -11,7 +11,7 @@ TARGET_DIR="${1:-$REPO_ROOT/src/data}"
 ZIP_FILE="$(mktemp /tmp/shipnetsim_data_XXXXXX.zip)"
 
 # Dropbox direct download link (dl=1 forces direct download)
-DOWNLOAD_URL="https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=ycbk7bjc&dl=1"
+DOWNLOAD_URL="https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=u3nb5y7k&dl=1"
 
 cleanup() {
     rm -f "$ZIP_FILE"

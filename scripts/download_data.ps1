@@ -15,7 +15,7 @@ if (-not $TargetDir) {
 }
 
 # Dropbox direct download link (dl=1 forces direct download)
-$DownloadUrl = "https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=ycbk7bjc&dl=1"
+$DownloadUrl = "https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=u3nb5y7k&dl=1"
 
 $ZipFile = Join-Path ([System.IO.Path]::GetTempPath()) "shipnetsim_data_$([System.IO.Path]::GetRandomFileName()).zip"
 $ExtractDir = Join-Path ([System.IO.Path]::GetTempPath()) "shipnetsim_extract_$([System.IO.Path]::GetRandomFileName())"

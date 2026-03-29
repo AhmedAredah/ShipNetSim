@@ -119,7 +119,7 @@ ShipNetSim requires geographic data files (TIFF imagery, shapefiles, etc.) that 
 ```
 
 **Manual download:**
-1. Download the data zip from [Dropbox](https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=ycbk7bjc&dl=1)
+1. Download the data zip from [Dropbox](https://www.dropbox.com/scl/fi/obf8duo6ewnez5q363vwn/data.zip?rlkey=9by8u5ci1miag453rhvp2ilmw&st=u3nb5y7k&dl=1)
 2. Extract the contents into `src/data/`
 
 ## Building from Source
