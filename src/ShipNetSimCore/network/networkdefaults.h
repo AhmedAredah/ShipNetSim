@@ -14,7 +14,7 @@ static const QVector<QString> &
 worldNetworkLocation(QString baseDirectory)
 {
     static QVector<QString> v{
-        QDir(baseDirectory).filePath("ne_110m_ocean.shp")};
+        QDir(baseDirectory).filePath("ne_10m_ocean.shp")};
     return v;
 };
 
