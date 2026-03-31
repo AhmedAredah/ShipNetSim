@@ -37,7 +37,7 @@ This directory is for your local input files that will be used with ShipNetSim.
 
 ## Built-in Files (accessible via image: prefix):
 - `image:sampleShip.dat` - Sample ship configuration
-- `default` - Default ocean boundaries (ne_110m_ocean.shp)
+- `default` - Default ocean boundaries (ne_10m_ocean.shp)
 
 Run `./docker/scripts/run-cli.sh --help` for more information.
 EOF
@@ -87,7 +87,7 @@ show_usage() {
     echo "  -s, --ships-file <file>     Ships configuration file (.dat format) (REQUIRED)"
     echo ""
     echo "Optional (with defaults):"
-    echo "  -b, --water-boundaries-file Water boundaries file (default: ./data/ne_110m_ocean.shp)"
+    echo "  -b, --water-boundaries-file Water boundaries file (default: ./data/ne_10m_ocean.shp)"
     echo "  -o, --output-folder         Output directory (default: ./output)"
     echo "  -r, --result-summaries      Summary filename (default: shipSummary_TIMESTAMP.txt)"
     echo ""
@@ -240,7 +240,7 @@ fi
 
 # Add default water boundaries file if not provided
 if ! $BOUNDARIES_FILE_PROVIDED; then
-    echo "No water boundaries file specified, using default: ne_110m_ocean.shp"
+    echo "No water boundaries file specified, using default: ne_10m_ocean.shp"
     PROCESSED_ARGS+=("-b" "default")
 fi
 
@@ -257,7 +257,7 @@ if ! $RESULT_SUMMARIES_PROVIDED; then
 fi
 
 # Check if the default boundary file exists in the local data directory
-if ! $BOUNDARIES_FILE_PROVIDED && [[ ! -f "$DATA_DIR/ne_110m_ocean.shp" ]]; then
+if ! $BOUNDARIES_FILE_PROVIDED && [[ ! -f "$DATA_DIR/ne_10m_ocean.shp" ]]; then
     echo "INFO: Default boundary file not found in local data directory."
     echo "      Using built-in default boundary file from Docker image."
 fi

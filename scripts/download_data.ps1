@@ -68,7 +68,7 @@ try {
     Write-Host "Verifying extraction..."
     $ExpectedFiles = @(
         "NE1_HR_LC_SR_W_DR.tif",
-        "ne_110m_ocean.shp",
+        "ne_10m_ocean.shp",
         "WaterDepth.tif"
     )
 
