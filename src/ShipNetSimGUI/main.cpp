@@ -126,7 +126,7 @@ int main(int argc, char *argv[])
     GlobalMapManager::getInstance()->preloadModelData();
 
     // Create main window
-    splash.showMessage("Initializing main window...",
+    splash.showMessage("Loading network...",
                        Qt::AlignBottom | Qt::AlignCenter, Qt::white);
     app.processEvents();
     ShipNetSim w;
