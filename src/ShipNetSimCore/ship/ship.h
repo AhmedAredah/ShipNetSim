@@ -1399,11 +1399,12 @@ public:
 
     [[nodiscard]] bool isExperiencingHighResistance();
 
-    // [[nodiscard]] units::velocity::meters_per_second_t
-    // getCurrentMaxSpeed();
-    // [[nodiscard]] QHash<qsizetype,
-    // units::velocity::meters_per_second_t>
-    // getAheadLowerSpeeds(qsizetype nextStopIndex);
+    [[nodiscard]] QHash<qsizetype,
+                        units::velocity::meters_per_second_t>
+    getAheadLowerSpeeds(qsizetype nextStopIndex);
+
+    [[nodiscard]] units::velocity::meters_per_second_t
+    calcMaxSpeedForRadius(units::length::meter_t radius) const;
 
     /**
      * @brief Moves the ship forward by a specified distance.
@@ -1814,12 +1815,10 @@ private:
     //! to make the search faster.
     qsizetype mPreviousPathPointIndex;
 
-    //!< Hold the node index of the point (and its lower speed)
-    //!  where the following link has lower speed than the current
-    //! link speed of the ship.
-    QVector<QVector<
-        QHash<qsizetype, units::velocity::meters_per_second_t>>>
-        mLowerSpeedLinkIndex;
+    //!< Precomputed turn speed limits: waypoint index → max speed.
+    //! Computed once in setPath() based on turn geometry and Nomoto model.
+    QHash<qsizetype, units::velocity::meters_per_second_t>
+        mTurnSpeedLimits;
 
     QMap<units::velocity::meters_per_second_t, units::length::meter_t>
         mGapCache;

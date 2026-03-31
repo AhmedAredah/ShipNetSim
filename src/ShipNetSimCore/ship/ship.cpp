@@ -1756,19 +1756,85 @@ void Ship::setPath(const QVector<std::shared_ptr<GPoint>> points,
 
     smoothConfig.minTurnAngle = units::angle::degree_t(5.0);
     smoothConfig.allowRadiusReduction = true;
-    smoothConfig.minRadius = units::length::meter_t(50.0);
+    // Minimum arc radius = ship length (Nomoto model floor).
+    // Arcs tighter than this are physically impossible at any speed.
+    smoothConfig.minRadius = getLengthInWaterline();
 
     // Apply path smoothing
     ShortestPathResult smoothedPath =
         DubinsPathSmoother::smoothPath(rawPath, smoothConfig);
 
-    mPathPoints      = smoothedPath.points;
-    mPathLines       = smoothedPath.lines;
+    // TEMP DEBUG: skip Dubins, use raw path to test if circling stops
+    mPathPoints      = rawPath.points;
+    mPathLines       = rawPath.lines;
     mLinksCumLengths = generateCumLinesLengths();
     mTotalPathLength = mLinksCumLengths.back();
     mCurrentState =
         GAlgebraicVector(*(mPathPoints.at(0)), *(mPathPoints.at(1)));
     computeStoppingPointIndices();
+
+    // Precompute turn speed limits for all waypoints.
+    // Uses the turning radius at max speed (largest radius = worst case)
+    // and inverts Nomoto to find max speed for each tight turn.
+    mTurnSpeedLimits.clear();
+    if (mPathPoints.size() >= 3)
+    {
+        // Compute the turning radius at max speed using Nomoto forward:
+        // R = U / (K_eff * delta)
+        double C_B_val = getBlockCoef();
+        double T_val   = getMeanDraft().value();
+        double B_val   = getBeam().value();
+        double L_val   = getLengthInWaterline().value();
+        double delta_val = mRudderAngle
+            .convert<units::angle::radian>().value();
+        if (std::abs(delta_val) < 0.001) delta_val = 0.436;
+        if (C_B_val < 0.01) C_B_val = 0.6;
+        if (T_val < 0.1) T_val = 1.0;
+        if (B_val < 0.1) B_val = 1.0;
+
+        double K_hull_val = 0.008 / (C_B_val * (T_val / B_val));
+        double Fn_max = mMaxSpeed.value()
+            / std::sqrt(9.81 * L_val);
+        double sf_max = std::sqrt(
+            std::max(Fn_max, 0.05) / 0.20);
+        sf_max = std::clamp(sf_max, 0.5, 1.5);
+        double K_eff_max = std::clamp(K_hull_val * sf_max, 0.01, 0.06);
+        double R_at_maxSpeed = mMaxSpeed.value()
+            / (K_eff_max * delta_val);
+        R_at_maxSpeed = std::max(R_at_maxSpeed, L_val);
+
+        for (qsizetype i = 1; i < mPathPoints.size() - 1; ++i)
+        {
+            auto turnAngle = DubinsPathSmoother::calculateTurnAngle(
+                mPathPoints[i - 1], mPathPoints[i], mPathPoints[i + 1]);
+
+            double absTurn = std::abs(turnAngle.value());
+            if (absTurn < 15.0) continue;
+
+            double halfTurnRad = (absTurn / 2.0) * M_PI / 180.0;
+            double tanHalfTurn = std::tan(halfTurnRad);
+            if (tanHalfTurn > 100.0 || tanHalfTurn < 0.001) continue;
+
+            double distPrev =
+                mPathPoints[i]->distance(*mPathPoints[i - 1]).value();
+            double distNext =
+                mPathPoints[i]->distance(*mPathPoints[i + 1]).value();
+            double minAvail = std::min(distPrev, distNext);
+
+            // If the ship's max-speed radius fits, no limit needed
+            if (R_at_maxSpeed * tanHalfTurn <= minAvail) continue;
+
+            // Must reduce radius to fit
+            double arcRadius = (minAvail * 0.9) / tanHalfTurn;
+            auto maxSpeed = calcMaxSpeedForRadius(
+                units::length::meter_t(arcRadius));
+
+            if (maxSpeed < mMaxSpeed)
+            {
+                mTurnSpeedLimits[i] = maxSpeed;
+            }
+        }
+    }
 }
 
 std::shared_ptr<GPoint> Ship::startPoint()
@@ -3686,6 +3752,69 @@ units::length::meter_t Ship::calcTurningRadius() const
     }
 
     return units::length::meter_t(R);
+}
+
+units::velocity::meters_per_second_t
+Ship::calcMaxSpeedForRadius(units::length::meter_t radius) const
+{
+    // Nomoto inversion: R = U / (K_eff × δ)  →  U = R × K_eff × δ
+    //
+    // K_eff depends on speed (via Froude number), so use the
+    // conservative minimum K_eff (lowest speed_factor = 0.5).
+    // This gives a slightly lower speed than strictly needed,
+    // which is safe — the ship brakes a bit more than necessary.
+
+    double C_B = getBlockCoef();
+    double T   = getMeanDraft().value();
+    double B   = getBeam().value();
+    double L   = getLengthInWaterline().value();
+    double delta = mRudderAngle.convert<units::angle::radian>().value();
+
+    if (std::abs(delta) < 0.001) delta = 0.436;
+    if (C_B < 0.01) C_B = 0.6;
+    if (T < 0.1) T = 1.0;
+    if (B < 0.1) B = 1.0;
+
+    constexpr double K_0 = 0.008;
+    double K_hull = K_0 / (C_B * (T / B));
+
+    // Use minimum speed_factor (0.5) for conservative estimate
+    double K_eff = K_hull * 0.5;
+    K_eff = std::clamp(K_eff, 0.01, 0.06);
+
+    double U = radius.value() * K_eff * delta;
+
+    // Floor: ship length gives the minimum turning radius
+    // regardless of speed, so cap U at max speed
+    U = std::min(U, mMaxSpeed.value());
+
+    return units::velocity::meters_per_second_t(std::max(U, 0.0));
+}
+
+QHash<qsizetype, units::velocity::meters_per_second_t>
+Ship::getAheadLowerSpeeds(qsizetype nextStopIndex)
+{
+    QHash<qsizetype, units::velocity::meters_per_second_t> result;
+
+    // Return the nearest precomputed turn speed limit ahead of the
+    // ship's current position. Only one is needed — the deceleration
+    // model will handle it, and the next limit will be returned after
+    // the ship passes this one.
+    qsizetype startIdx = mPreviousPathPointIndex + 1;
+    qsizetype endIdx   = std::min(nextStopIndex,
+                                   (qsizetype)(mPathPoints.size() - 1));
+
+    for (qsizetype i = startIdx; i <= endIdx; ++i)
+    {
+        auto it = mTurnSpeedLimits.constFind(i);
+        if (it != mTurnSpeedLimits.constEnd())
+        {
+            result[i] = it.value();
+            break;  // Only the nearest tight turn
+        }
+    }
+
+    return result;
 }
 
 }; // namespace ShipNetSimCore
