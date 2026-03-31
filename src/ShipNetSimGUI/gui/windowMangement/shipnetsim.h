@@ -17,7 +17,7 @@ QT_END_NAMESPACE
 
 
 // static QString WATER_BOUNDRIES_FILE =
-//     ShipNetSimCore::Utils::getDataFile("ne_110m_ocean.shp");
+//     ShipNetSimCore::Utils::getDataFile("ne_10m_ocean.shp");
 static QList<int> OPTIONAL_SHIPS_TABLE_COLUMNS;
 
 class ShipNetSim : public QMainWindow
