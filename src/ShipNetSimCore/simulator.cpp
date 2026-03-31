@@ -1330,24 +1330,24 @@ void Simulator::playShipOneTimeStep(std::shared_ptr<Ship> ship)
         Ship::stopPointDefinition stopPoint =
             ship->getNextStoppingPoint();
 
-        // get the lower speeds links by their starting point
-        // auto aheadLowerSpeeds = ship->getAheadLowerSpeeds(
-        //     stopPoint.pointIndex);
-
         // define the critical points
         // a critical point is
-        // 1. any point that defines a lower max speed
+        // 1. any point that defines a lower max speed (tight turns)
         // 2. stopping point (port)
         criticalPoints cp;
 
-        // // add all lower speed points to their corresponding lists
-        // for (auto &index : aheadLowerSpeeds.keys())
-        // {
-        //     cp.gapToCriticalPoint.push_back(
-        //         ship->distanceFromCurrentPositionToNodePathIndex(index));
-        //     cp.speedAtCriticalPoint.push_back(aheadLowerSpeeds[index]);
-        //     cp.isFollowingAnotherShip.push_back(false);
-        // }
+        // Add turn-speed-limited waypoints as critical points
+        auto aheadLowerSpeeds = ship->getAheadLowerSpeeds(
+            stopPoint.pointIndex);
+        for (auto it = aheadLowerSpeeds.constBegin();
+             it != aheadLowerSpeeds.constEnd(); ++it)
+        {
+            cp.gapToCriticalPoint.push_back(
+                ship->distanceFromCurrentPositionToNodePathIndex(
+                    it.key()));
+            cp.speedAtCriticalPoint.push_back(it.value());
+            cp.isFollowingAnotherShip.push_back(false);
+        }
 
         // add the stopping station to the list
         cp.gapToCriticalPoint.push_back(
