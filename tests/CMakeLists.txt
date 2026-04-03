@@ -54,6 +54,10 @@ add_shipnetsim_test(QuadtreeTest test_quadtree.cpp)
 add_shipnetsim_test(HierarchicalVisibilityGraphTest test_hierarchicalvisibilitygraph.cpp)
 add_shipnetsim_test(ShortestPathSyntheticTest test_shortestpath_synthetic.cpp)
 add_shipnetsim_test(ShortestPathRealWorldTest test_shortestpath_realworld.cpp)
+add_shipnetsim_test(BenchmarkPaper benchmark_paper.cpp)
+add_shipnetsim_test(BenchmarkFlatVsHier benchmark_flat_vs_hier.cpp)
+add_shipnetsim_test(BenchmarkNoCache benchmark_nocache.cpp)
+add_shipnetsim_test(BenchmarkNoCacheAllRoutes benchmark_nocache_allroutes.cpp)
 
 # # Real-world tests need longer timeout (HVG build can take several minutes
 # # for ne_10m_ocean.shp with 446K vertices). Set both CTest timeout and

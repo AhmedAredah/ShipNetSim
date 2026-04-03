@@ -1835,13 +1835,16 @@ ShortestPathResult HierarchicalVisibilityGraph::searchAtLevel(
             double edgeCost =
                 current->fastDistance(*neighbor).value();
 
-            // Apply penalty for edges flagged by iterative validation
+            // Apply penalty for edges flagged by iterative validation.
+            // Use level vertex indices (stable, always available) instead
+            // of corridor vertex indices (only exist after precompute).
             if (corridor && !corridor->penalizedEdges.empty())
             {
-                auto ci = corridor->vertexIndex.find(current);
-                auto ni = corridor->vertexIndex.find(neighbor);
-                if (ci != corridor->vertexIndex.end()
-                    && ni != corridor->vertexIndex.end())
+                const auto& penLvl = mLevels[level];
+                auto ci = penLvl.vertexIndex.find(current);
+                auto ni = penLvl.vertexIndex.find(neighbor);
+                if (ci != penLvl.vertexIndex.end()
+                    && ni != penLvl.vertexIndex.end())
                 {
                     if (corridor->penalizedEdges.count(
                             Corridor::edgeKey(ci->second,
@@ -1891,7 +1894,9 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal)
 {
-    ensureCoarseAdjacency();
+    // If coarse adjacency is cached (from .hvg_adj file), use it globally.
+    // Otherwise, build corridor-local adjacency on demand at each level.
+    bool hasCoarseAdj = mCoarseAdjReady;
 
     QElapsedTimer hsTimer;
     hsTimer.start();
@@ -1937,9 +1942,27 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
     if (!result3.isValid())
     {
-        result3 = searchAtLevel(start, goal, 3, nullptr,
-                                snappedStart, snappedGoal);
-        qDebug() << "  L3 A*:" << (result3.isValid() ? "valid" : "INVALID")
+        if (!hasCoarseAdj)
+        {
+            // Build a corridor around the direct start→goal line for L3
+            ShortestPathResult directGuide;
+            directGuide.points.append(snappedStart ? snappedStart : start);
+            directGuide.points.append(snappedGoal ? snappedGoal : goal);
+            directGuide.lines.append(std::make_shared<GLine>(
+                directGuide.points[0], directGuide.points[1], FastConstruct));
+            auto corridor3 = buildCorridor(directGuide, 3,
+                                           CORRIDOR_EXPANSION[2]);  // wide
+            result3 = searchAtLevel(start, goal, 3, &corridor3,
+                                    snappedStart, snappedGoal,
+                                    false);  // Dijkstra at L3 for optimal guidance
+        }
+        else
+        {
+            result3 = searchAtLevel(start, goal, 3, nullptr,
+                                    snappedStart, snappedGoal,
+                                    false);  // Dijkstra at L3 for optimal guidance
+        }
+        qDebug() << "  L3 Dijkstra:" << (result3.isValid() ? "valid" : "INVALID")
                  << hsTimer.elapsed() << "ms";
     }
 
@@ -2068,11 +2091,37 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     }
     else
     {
-        // Pre-compute corridor adjacency with phased approach,
-        // then validate with penalty-based iterative pruning.
+        // Lazy corridor-filtered L0 search with penalty-based
+        // iterative validation. No eager precomputeCorridorAdjacency —
+        // getVisibleNodesForPoint uses the lazy corridor path instead.
+
+        // Ensure snapped start/goal are in L0 vertexIndex for penalty
+        // recording. snapToWater can return the original user point
+        // (in-water case, line 1574) which is NOT a polygon vertex and
+        // NOT in vertexIndex. Without this, penalty validation cannot
+        // penalize edges involving start/goal.
+        {
+            auto& lvl0 = mLevels[0];
+            auto ensureInIndex = [&](const std::shared_ptr<GPoint>& pt) {
+                if (!pt) return;
+                if (lvl0.vertexIndex.find(pt) == lvl0.vertexIndex.end())
+                {
+                    int idx = lvl0.vertices.size();
+                    lvl0.vertices.append(pt);
+                    lvl0.vertexIndex[pt] = idx;
+                }
+            };
+            ensureInIndex(snappedStart);
+            ensureInIndex(snappedGoal);
+        }
+
+        // Validate path edges and penalize bad ones. Uses level vertex
+        // indices (always available) instead of corridor vertex indices
+        // (only exist after precomputeCorridorAdjacency).
         auto validateAndSearch =
             [&](Corridor& corr) -> ShortestPathResult
         {
+            const auto& lvl0 = mLevels[0];
             ShortestPathResult bestResult;
             int bestBadCount = std::numeric_limits<int>::max();
 
@@ -2094,12 +2143,12 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
                     if (!isSegmentVisible(result.lines[i], 0))
                     {
-                        auto si = corr.vertexIndex.find(
+                        auto si = lvl0.vertexIndex.find(
                             result.points[i]);
-                        auto ei = corr.vertexIndex.find(
+                        auto ei = lvl0.vertexIndex.find(
                             result.points[i + 1]);
-                        if (si != corr.vertexIndex.end()
-                            && ei != corr.vertexIndex.end())
+                        if (si != lvl0.vertexIndex.end()
+                            && ei != lvl0.vertexIndex.end())
                         {
                             corr.penalizedEdges.insert(
                                 Corridor::edgeKey(si->second,
@@ -2123,7 +2172,6 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
         };
 
         auto corridor0 = buildCorridor(bestCoarseResult, 0, expansion0);
-        precomputeCorridorAdjacency(corridor0, start, goal);
         auto result0 = validateAndSearch(corridor0);
 
         if (result0.isValid())
@@ -2131,8 +2179,6 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
         auto widerCorridor0 = buildCorridor(bestCoarseResult, 0,
                                             expansion0 * 3.0);
-        precomputeCorridorAdjacency(widerCorridor0, start, goal,
-                                    &corridor0);
         result0 = validateAndSearch(widerCorridor0);
 
         if (result0.isValid())
@@ -2140,8 +2186,6 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
         auto veryWideCorridor0 = buildCorridor(bestCoarseResult, 0,
                                                expansion0 * 10.0);
-        precomputeCorridorAdjacency(veryWideCorridor0, start, goal,
-                                    &widerCorridor0);
         result0 = validateAndSearch(veryWideCorridor0);
 
         if (result0.isValid())
@@ -2315,9 +2359,10 @@ void HierarchicalVisibilityGraph::precomputeCorridorAdjacency(
     Corridor& corridor,
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal,
-    const Corridor* previousCorridor)
+    const Corridor* previousCorridor,
+    int level)
 {
-    const auto& lvl = mLevels[0];
+    const auto& lvl = mLevels[level];
 
     // Track which vertices are inherited from the previous corridor
     int inheritedCount = 0;
@@ -2409,7 +2454,7 @@ void HierarchicalVisibilityGraph::precomputeCorridorAdjacency(
 
         for (int j = jStart; j < n; ++j)
         {
-            if (isVisible(corridor.vertices[i], corridor.vertices[j], 0))
+            if (isVisible(corridor.vertices[i], corridor.vertices[j], level))
             {
                 corridor.adjacency[i].push_back(j);
                 corridor.adjacency[j].push_back(i);
@@ -3163,13 +3208,15 @@ HierarchicalVisibilityGraph::getVisibleNodesForPoint(
     }
 
     // Check if node is a known vertex with pre-computed adjacency.
-    // For Level 0, only use adjacency when the atomic flag confirms the
-    // build is complete — otherwise the background thread may be writing
-    // to the same vectors (data race -> crash).
+    // For Level 0, require the atomic build-complete flag.
+    // For coarse levels, require mCoarseAdjReady — not just non-empty
+    // adjacency, because injectPointIntoLevel resizes lvl.adjacency
+    // (making it non-empty) without building meaningful edges.
     auto it = lvl.vertexIndex.find(node);
     bool adjReady = !lvl.adjacency.empty()
-                    && (level > 0
-                        || mLevel0AdjReady.load(std::memory_order_acquire));
+                    && (level == 0
+                        ? mLevel0AdjReady.load(std::memory_order_acquire)
+                        : mCoarseAdjReady);
     if (it != lvl.vertexIndex.end() && adjReady)
     {
         int idx = it->second;
@@ -3186,6 +3233,25 @@ HierarchicalVisibilityGraph::getVisibleNodesForPoint(
                 result.append(lvl.vertices[neighborIdx]);
             }
         }
+    }
+    else if (corridor && !corridor->hasAdjacency && !adjReady)
+    {
+        // Lazy corridor-filtered on-demand visibility.
+        // Collect candidates from corridor's allowed vertices only
+        // (restricted to the geographic tube), then check visibility
+        // at the correct level (simplified polygons = fewer edges).
+        QVector<std::shared_ptr<GPoint>> candidates;
+        candidates.reserve(
+            static_cast<int>(corridor->allowedVertexIndices.size()));
+        for (int idx : corridor->allowedVertexIndices)
+        {
+            if (idx < lvl.vertices.size() && *lvl.vertices[idx] != *node)
+                candidates.append(lvl.vertices[idx]);
+        }
+
+        result = findNearestVisibleNodes(
+            node, candidates, level,
+            ON_DEMAND_MAX_CHECK, ON_DEMAND_MAX_FOUND);
     }
     else
     {
@@ -4036,6 +4102,58 @@ ShortestPathResult HierarchicalVisibilityGraph::findShortestPath(
         }
     }
     return hierarchicalSearch(start, goal);
+}
+
+ShortestPathResult HierarchicalVisibilityGraph::findShortestPathFlat(
+    const std::shared_ptr<GPoint>& start,
+    const std::shared_ptr<GPoint>& goal)
+{
+    // Direct visibility shortcut
+    if (start && goal && !(*start == *goal)) {
+        auto directLine = std::make_shared<GLine>(start, goal);
+        if (isSegmentVisible(directLine, 0)) {
+            ShortestPathResult result;
+            result.points.append(start);
+            result.points.append(goal);
+            result.lines.append(directLine);
+            return result;
+        }
+    }
+
+    // Snap once at L0
+    auto snappedStart = snapToWater(start, 0);
+    auto snappedGoal  = snapToWater(goal, 0);
+
+    // Unconstrained Dijkstra on full L0 graph (h=0, no corridor, no budget)
+    return searchAtLevel(start, goal, 0, nullptr,
+                         snappedStart, snappedGoal,
+                         false, -1);  // false=Dijkstra, -1=unlimited
+}
+
+ShortestPathResult HierarchicalVisibilityGraph::findShortestPathFlatAStar(
+    const std::shared_ptr<GPoint>& start,
+    const std::shared_ptr<GPoint>& goal)
+{
+    // Direct visibility shortcut
+    if (start && goal && !(*start == *goal)) {
+        auto directLine = std::make_shared<GLine>(start, goal);
+        if (isSegmentVisible(directLine, 0)) {
+            ShortestPathResult result;
+            result.points.append(start);
+            result.points.append(goal);
+            result.lines.append(directLine);
+            return result;
+        }
+    }
+
+    // Snap once at L0
+    auto snappedStart = snapToWater(start, 0);
+    auto snappedGoal  = snapToWater(goal, 0);
+
+    // Unconstrained A* on full L0 graph (h=haversine, no corridor, no budget)
+    return searchAtLevel(start, goal, 0, nullptr,
+                         snappedStart, snappedGoal,
+                         true, -1);  // true=A*, -1=unlimited
 }
 
 ShortestPathResult HierarchicalVisibilityGraph::findShortestPath(

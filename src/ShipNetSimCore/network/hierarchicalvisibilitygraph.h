@@ -114,7 +114,7 @@ struct Corridor
     bool hasAdjacency = false;
 
     /// Edges penalized by iterative path validation (+1e9 cost).
-    /// Key: edgeKey(u, v) where u, v are corridor vertex indices.
+    /// Key: edgeKey(u, v) where u, v are level vertex indices.
     std::unordered_set<long long> penalizedEdges;
 
     /** @brief Compute a unique symmetric key for an edge (u, v). */
@@ -148,6 +148,20 @@ public:
     ShortestPathResult
     findShortestPath(const std::shared_ptr<GPoint>& start,
                      const std::shared_ptr<GPoint>& goal);
+
+    /** @brief Flat (unconstrained) search on Level 0 — no hierarchy.
+     *  Uses Dijkstra (h=0) for guaranteed optimality on the full L0 graph.
+     *  Intended for baseline comparison benchmarks. */
+    ShortestPathResult
+    findShortestPathFlat(const std::shared_ptr<GPoint>& start,
+                         const std::shared_ptr<GPoint>& goal);
+
+    /** @brief Flat (unconstrained) A* on Level 0 — no hierarchy.
+     *  Uses haversine heuristic for directional guidance but no corridors.
+     *  Intended for baseline comparison benchmarks. */
+    ShortestPathResult
+    findShortestPathFlatAStar(const std::shared_ptr<GPoint>& start,
+                              const std::shared_ptr<GPoint>& goal);
 
     ShortestPathResult
     findShortestPath(QVector<std::shared_ptr<GPoint>> mustTraversePoints);
@@ -463,7 +477,8 @@ private:
         Corridor& corridor,
         const std::shared_ptr<GPoint>& start,
         const std::shared_ptr<GPoint>& goal,
-        const Corridor* previousCorridor = nullptr);
+        const Corridor* previousCorridor = nullptr,
+        int level = 0);
 
     ShortestPathResult hierarchicalSearch(
         const std::shared_ptr<GPoint>& start,
