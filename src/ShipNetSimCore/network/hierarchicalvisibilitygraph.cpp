@@ -2028,12 +2028,21 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
     // --- Level 1 ---
     double expansion1 = CORRIDOR_EXPANSION[1];
-    if (bestCoarseResult.points.size() <= 2)
     {
         double routeDist = GSegment::haversineRaw(
             start->getLongitude().value(), start->getLatitude().value(),
             goal->getLongitude().value(), goal->getLatitude().value());
-        expansion1 = std::max(expansion1, routeDist * 0.25);
+        if (bestCoarseResult.points.size() <= 2)
+        {
+            expansion1 = std::max(expansion1, routeDist * 0.25);
+        }
+        else
+        {
+            // Even with a multi-point coarse guide, open-ocean segments
+            // produce tube corridors with very few vertices at L1.
+            // Ensure minimum expansion proportional to route distance.
+            expansion1 = std::max(expansion1, routeDist * 0.05);
+        }
     }
     auto corridor1 = buildCorridor(bestCoarseResult, 1, expansion1);
     if (!hasCoarseAdj)
@@ -2158,8 +2167,18 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                                                expansion0 * 10.0);
         buildCorridorAdjacencyPhased(veryWideCorridor0, start, goal,
                                      snappedStart, snappedGoal, 0);
+        // Budget: 3× corridor size. If A* can't find a path within
+        // this many expansions, the corridor is too boundary-heavy.
+        // Fall through to unconstrained L0 instead of running forever.
+        int corridorBudget = static_cast<int>(
+            veryWideCorridor0.allowedVertexIndices.size()) * 3;
+        fprintf(stderr, "[HS] L0 10x A* budget=%d starting...\n",
+                corridorBudget);
         result0 = searchAtLevel(start, goal, 0, &veryWideCorridor0,
-                                snappedStart, snappedGoal);
+                                snappedStart, snappedGoal,
+                                true, corridorBudget);
+        fprintf(stderr, "[HS] L0 10x A* %s\n",
+                result0.isValid() ? "OK" : "FAIL");
         if (result0.isValid())
             return result0;
     }
@@ -2571,9 +2590,10 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
 
     // Sample density proportional to corridor size. The cached build
     // checks every vertex (sampleStep=1), but vis checks cost ~1-5ms.
-    // Budget: ~3000 vis checks → ~3-15s for Phase 2.
-    // Every-vertex for small corridors, scale up for large ones.
-    int maxVisChecks = 3000;
+    // Target: ~1 express edge per 5 corridor vertices for adequate
+    // A* shortcutting. Minimum budget 3000, scaling with corridor size.
+    // For 27K verts: budget=5400 → step=40 → 675 samples → ~2K express.
+    int maxVisChecks = std::max(3000, n / 5);
     int sampleStep = std::max(1, (n * 8) / maxVisChecks);
 
     // Search radius matching the cached build:
