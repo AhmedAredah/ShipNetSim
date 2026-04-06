@@ -1983,7 +1983,20 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
     // --- Level 2 ---
     double expansion2 = CORRIDOR_EXPANSION[2];
-    auto corridor2 = buildCorridor(result3, 2, expansion2);
+    // When the coarse guide is a 2-point straight line (polygon graph
+    // with only 2 polygons), the corridor tube is useless — it follows
+    // the straight line through land. Use route-distance-proportional
+    // expansion to capture the actual water route.
+    if (bestCoarseResult.points.size() <= 2)
+    {
+        double routeDist = GSegment::haversineRaw(
+            start->getLongitude().value(), start->getLatitude().value(),
+            goal->getLongitude().value(), goal->getLatitude().value());
+        // 25% of route distance as expansion — enough to reach around
+        // continents while still limiting corridor size
+        expansion2 = std::max(expansion2, routeDist * 0.25);
+    }
+    auto corridor2 = buildCorridor(bestCoarseResult, 2, expansion2);
     if (!hasCoarseAdj)
         buildCorridorAdjacencyPhased(corridor2, start, goal,
                                      snappedStart, snappedGoal, 2);
@@ -2015,6 +2028,13 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
 
     // --- Level 1 ---
     double expansion1 = CORRIDOR_EXPANSION[1];
+    if (bestCoarseResult.points.size() <= 2)
+    {
+        double routeDist = GSegment::haversineRaw(
+            start->getLongitude().value(), start->getLatitude().value(),
+            goal->getLongitude().value(), goal->getLatitude().value());
+        expansion1 = std::max(expansion1, routeDist * 0.25);
+    }
     auto corridor1 = buildCorridor(bestCoarseResult, 1, expansion1);
     if (!hasCoarseAdj)
         buildCorridorAdjacencyPhased(corridor1, start, goal,
