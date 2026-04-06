@@ -113,6 +113,10 @@ struct Corridor
         GPoint::Hash, GPoint::Equal> vertexIndex;
     bool hasAdjacency = false;
 
+    /// Coarse path waypoints that guided this corridor's creation.
+    /// Used to project cross-water spine edges into the corridor.
+    QVector<std::shared_ptr<GPoint>> coarseWaypoints;
+
     /// Edges penalized by iterative path validation (+1e9 cost).
     /// Key: edgeKey(u, v) where u, v are level vertex indices.
     std::unordered_set<long long> penalizedEdges;

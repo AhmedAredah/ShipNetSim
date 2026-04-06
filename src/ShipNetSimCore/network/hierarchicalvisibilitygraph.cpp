@@ -344,11 +344,13 @@ void HierarchicalVisibilityGraph::buildAdjacencyForLevel(int idx)
     qDebug() << "  Phase 1 (boundary edges) done in"
              << timer.elapsed() << "ms";
 
-    // Phase 2: spatial grid edges — O(n × k), with visibility checking
-    // to ensure coarse-level edges don't cross land (correct corridor guidance)
+    // Phase 2: spatial grid edges — O(n × k), skip visibility for L1-L3.
+    // Coarse levels are corridor guidance only (never returned as final paths).
+    // Visibility checks at L1 (226K verts) would cost minutes — unnecessary
+    // since simplified polygons already approximate land boundaries.
     if (maxDist > 0.0)
     {
-        addSpatialGridEdges(level, idx, maxDist, true);
+        addSpatialGridEdges(level, idx, maxDist, false);
         qDebug() << "  Phase 2 (spatial grid, vis-checked) done in"
                  << timer.elapsed() << "ms";
     }
@@ -1894,11 +1896,9 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal)
 {
-    // Ensure coarse-level adjacency (L1-L3) is always available.
-    // Without it, corridor guidance degrades to a straight-line tube
-    // from start to goal — which misses routes that detour around
-    // continents. Coarse build is one-time (~14s for 346K vertices).
-    ensureCoarseAdjacency();
+    // Use pre-built coarse adjacency if available (cached mode).
+    // In no-cache mode, buildCorridorAdjacencyPhased handles L2/L1
+    // corridor adjacency on-demand — no full-level build needed.
     bool hasCoarseAdj = mCoarseAdjReady;
 
     QElapsedTimer hsTimer;
@@ -1993,12 +1993,12 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
              << "verts," << (result2.isValid() ? "valid" : "INVALID")
              << hsTimer.elapsed() << "ms";
 
-    if (!result2.isValid() && hasCoarseAdj)
+    if (!result2.isValid())
     {
-        // Wider retry only when coarse adjacency is cached (cheap).
-        // In no-cache mode, wider corridors add vertices but coarse
-        // polygons miss fine detail — diminishing returns.
         auto widerCorridor2 = buildCorridor(result3, 2, expansion2 * 3.0);
+        if (!hasCoarseAdj)
+            buildCorridorAdjacencyPhased(widerCorridor2, start, goal,
+                                         snappedStart, snappedGoal, 2);
         result2 = searchAtLevel(start, goal, 2, &widerCorridor2,
                                snappedStart, snappedGoal);
         qDebug() << "  L2 wider:" << widerCorridor2.allowedVertexIndices.size()
@@ -2025,10 +2025,13 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
              << "verts," << (result1.isValid() ? "valid" : "INVALID")
              << hsTimer.elapsed() << "ms";
 
-    if (!result1.isValid() && hasCoarseAdj)
+    if (!result1.isValid())
     {
         auto widerCorridor1 = buildCorridor(bestCoarseResult, 1,
                                             expansion1 * 3.0);
+        if (!hasCoarseAdj)
+            buildCorridorAdjacencyPhased(widerCorridor1, start, goal,
+                                         snappedStart, snappedGoal, 1);
         result1 = searchAtLevel(start, goal, 1, &widerCorridor1,
                                snappedStart, snappedGoal);
         qDebug() << "  L1 wider:" << widerCorridor1.allowedVertexIndices.size()
@@ -2297,6 +2300,9 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
         }
     }
 
+    // Store coarse waypoints for spine projection in adjacency building
+    corridor.coarseWaypoints = coarsePath.points;
+
     qDebug() << "Corridor for level" << targetLevel << ":"
              << corridor.allowedVertexIndices.size()
              << "allowed vertices out of" << lvl.vertices.size();
@@ -2418,6 +2424,92 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     int boundaryEdges = static_cast<int>(edgeSet.size());
 
     // ---------------------------------------------------------------
+    // Phase 1.5: Coarse path spine projection
+    //
+    // The coarse path (from L1/L2) already traces the optimal water
+    // route with waypoints 50-500km apart. Project this spine into the
+    // L0 corridor by finding the nearest corridor vertex to each coarse
+    // waypoint and connecting consecutive spine vertices. This creates
+    // the cross-water edges that A* needs to avoid following coastlines.
+    //
+    // Without this, the corridor has ~97% boundary edges (coastline) and
+    // only ~3% express/bridge. A* follows the coast because there's no
+    // edge spanning open water between distant coastline segments.
+    // ---------------------------------------------------------------
+    int spineEdges = 0;
+    int spineVisChecks = 0;
+    if (corridor.coarseWaypoints.size() >= 2)
+    {
+        // For each coarse waypoint, find the nearest K corridor vertices
+        // using a simple distance scan. K=4 provides redundancy.
+        constexpr int SPINE_K = 4;
+
+        auto findNearestCorridor = [&](double wpLon, double wpLat)
+            -> std::vector<int>
+        {
+            struct Cand { int ci; double dist; };
+            std::vector<Cand> cands;
+            cands.reserve(32);
+
+            // Scan all corridor vertices — corridor is small enough
+            for (int ci = 0; ci < n; ++ci)
+            {
+                double d = GSegment::haversineRaw(
+                    wpLon, wpLat, lons[ci], lats[ci]);
+                cands.push_back({ci, d});
+            }
+
+            // Partial sort for top K
+            int k = std::min(SPINE_K, static_cast<int>(cands.size()));
+            std::partial_sort(cands.begin(), cands.begin() + k,
+                              cands.end(),
+                              [](const Cand& a, const Cand& b) {
+                                  return a.dist < b.dist;
+                              });
+
+            std::vector<int> result;
+            for (int i = 0; i < k; ++i)
+                result.push_back(cands[i].ci);
+            return result;
+        };
+
+        // Find nearest corridor vertices for each coarse waypoint
+        std::vector<std::vector<int>> wpNearest;
+        wpNearest.reserve(corridor.coarseWaypoints.size());
+        for (const auto& wp : corridor.coarseWaypoints)
+        {
+            wpNearest.push_back(findNearestCorridor(
+                wp->getLongitude().value(), wp->getLatitude().value()));
+        }
+
+        // Connect consecutive waypoint neighborhoods with visibility
+        for (int w = 0; w + 1 < static_cast<int>(wpNearest.size()); ++w)
+        {
+            bool bridged = false;
+            for (int a : wpNearest[w])
+            {
+                for (int b : wpNearest[w + 1])
+                {
+                    if (a == b) continue;
+                    if (edgeSet.count(Corridor::edgeKey(a, b))) {
+                        bridged = true;
+                        continue;
+                    }
+                    spineVisChecks++;
+                    if (isVisible(corridor.vertices[a],
+                                  corridor.vertices[b], level))
+                    {
+                        addEdge(a, b);
+                        spineEdges++;
+                        bridged = true;
+                    }
+                }
+                if (bridged) break;  // one bridge per waypoint pair
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Phase 2: Yao-8 visibility shortcuts via corridor-local grid
     //
     // Sample every Kth corridor vertex, find nearest CORRIDOR vertex
@@ -2428,8 +2520,13 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     // Grid-based candidate discovery: O(1) per cell lookup — avoids
     // the 446K-edge level quadtree entirely.
     // ---------------------------------------------------------------
-    double cellDeg = 5.0 * mAvgSpacing / METERS_PER_DEGREE_LAT;
-    if (cellDeg < 0.01) cellDeg = 0.01;
+    // Grid parameters match the cached build (addSpatialGridEdges):
+    // same cell size and search radius so express edges span the same
+    // distance (50km at L0). This ensures corridors have equivalent
+    // cross-water connectivity to the pre-built adjacency.
+    double maxDist = mLevelMaxDistance[level];
+    double cellDeg = std::max(maxDist / (METERS_PER_DEGREE_LAT * 10.0),
+                              0.5);
     int visChecks = 0;
 
     // Hash grid: cellKey → list of corridor vertex indices
@@ -2452,16 +2549,17 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     };
     double coneWidth = 2.0 * M_PI / YAO_CONE_COUNT;
 
-    // Sampling rate: every Kth vertex. Adaptive to corridor size.
-    // Small corridors (<200): sample every 10th
-    // Large corridors: sample every EXPRESS_VERTEX_STEP (100)
-    int sampleStep = (n < 200) ? std::max(5, n / 20)
-                                : EXPRESS_VERTEX_STEP;
+    // Sample density proportional to corridor size. The cached build
+    // checks every vertex (sampleStep=1), but vis checks cost ~1-5ms.
+    // Budget: ~3000 vis checks → ~3-15s for Phase 2.
+    // Every-vertex for small corridors, scale up for large ones.
+    int maxVisChecks = 3000;
+    int sampleStep = std::max(1, (n * 8) / maxVisChecks);
 
-    // Search radius in grid cells: how far to look for octant candidates.
-    // Proportional to sample step so shortcuts span ~K ring-edges.
-    int searchCells = std::max(3, static_cast<int>(
-        sampleStep * mAvgSpacing / (METERS_PER_DEGREE_LAT * cellDeg)));
+    // Search radius matching the cached build:
+    // ceil(maxDist / (METERS_PER_DEGREE_LAT * cellDeg)) + 1
+    int searchCells = static_cast<int>(
+        std::ceil(maxDist / (METERS_PER_DEGREE_LAT * cellDeg))) + 1;
 
     for (int ci = 0; ci < n; ci += sampleStep)
     {
@@ -2498,6 +2596,11 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 for (int cj : git->second)
                 {
                     if (cj == ci) continue;
+                    // Haversine distance filter (same as cached build)
+                    double dist = GSegment::haversineRaw(
+                        vLon, vLat, lons[cj], lats[cj]);
+                    if (dist > maxDist) continue;
+
                     double dLon = wrapDLon(lons[cj] - vLon);
                     double dLat = lats[cj] - vLat;
                     double bearing = std::atan2(dLon, dLat);
@@ -2505,7 +2608,6 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                     int cone = static_cast<int>(bearing / coneWidth) % 8;
                     if (covered[cone]) continue;
 
-                    double dist = dLon * dLon + dLat * dLat;  // approx
                     if (dist < bestDist[cone])
                     {
                         bestDist[cone] = dist;
@@ -2762,9 +2864,10 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     corridor.hasAdjacency = true;
 
     fprintf(stderr, "[PHASED] L%d: %d verts, %zu edges "
-            "(bound:%d express:%d bridge:%d merge:%d) vis:%d %lldms\n",
-            level, n, edgeSet.size(), boundaryEdges, expressEdges,
-            bridgeEdges, mergeEdges, visChecks, timer.elapsed());
+            "(bound:%d spine:%d express:%d bridge:%d merge:%d) vis:%d %lldms\n",
+            level, n, edgeSet.size(), boundaryEdges, spineEdges, expressEdges,
+            bridgeEdges, mergeEdges, visChecks + spineVisChecks,
+            timer.elapsed());
 }
 
 // =============================================================================
