@@ -2497,7 +2497,7 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                     }
                     spineVisChecks++;
                     if (isVisible(corridor.vertices[a],
-                                  corridor.vertices[b], level))
+                                  corridor.vertices[b], 0))
                     {
                         addEdge(a, b);
                         spineEdges++;
@@ -2617,13 +2617,16 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
             }
         }
 
-        // Check visibility for best per octant
+        // Check visibility for best per octant.
+        // Always check against L0 polygons (finest resolution) to avoid
+        // false rejections from simplified geometry merging narrow
+        // waterways (English Channel, Strait of Gibraltar).
         for (int cone = 0; cone < 8; ++cone)
         {
             if (bestCi[cone] < 0) continue;
             visChecks++;
             if (isVisible(corridor.vertices[ci],
-                          corridor.vertices[bestCi[cone]], level))
+                          corridor.vertices[bestCi[cone]], 0))
             {
                 addEdge(ci, bestCi[cone]);
             }
@@ -2691,7 +2694,7 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 {
                     visChecks++;
                     if (isVisible(corridor.vertices[bestI],
-                                  corridor.vertices[bestJ], level))
+                                  corridor.vertices[bestJ], 0))
                     {
                         addEdge(bestI, bestJ);
                         bridgedRingPairs.insert(rpk);
@@ -2802,7 +2805,7 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
             {
                 visChecks++;
                 if (isVisible(corridor.vertices[bestI],
-                              corridor.vertices[bestJ], level))
+                              corridor.vertices[bestJ], 0))
                 {
                     addEdge(bestI, bestJ);
                     mergeEdges++;
@@ -2851,7 +2854,7 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
             if (found >= MAX_INJECT_NEIGHBORS) break;
             visChecks++;
             if (isVisible(corridor.vertices[epCi],
-                          corridor.vertices[c.ci], level))
+                          corridor.vertices[c.ci], 0))
             {
                 addEdge(epCi, c.ci);
                 found++;
