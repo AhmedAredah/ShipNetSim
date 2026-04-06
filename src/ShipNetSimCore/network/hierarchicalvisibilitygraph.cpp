@@ -2835,6 +2835,114 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     }
 
     // ---------------------------------------------------------------
+    // Phase 3c: Direct cross-component bridge for ocean crossings
+    //
+    // The grid-based merge (Phase 3b) can only bridge vertices within
+    // the same grid cell. For ocean crossings >890km between coastline
+    // fragments, the grid cells are too small. This phase directly
+    // scans the start's and goal's components for the nearest visible
+    // pair, with no grid-cell constraint.
+    //
+    // Evidence: Routes 11 (CapeTown→Mumbai, 2000km gap) and 12
+    // (Yokohama→LongBeach, 9000km gap) fail because Phase 3b can't
+    // bridge fragments separated by >890km.
+    // ---------------------------------------------------------------
+    if (startCi >= 0 && goalCi >= 0)
+    {
+        // Final connectivity check
+        std::vector<bool> visited(n, false);
+        std::queue<int> bfsQ;
+        bfsQ.push(startCi);
+        visited[startCi] = true;
+        bool goalReached = false;
+        while (!bfsQ.empty())
+        {
+            int u = bfsQ.front(); bfsQ.pop();
+            if (u == goalCi) { goalReached = true; break; }
+            for (int v : corridor.adjacency[u])
+            {
+                if (!visited[v])
+                {
+                    visited[v] = true;
+                    bfsQ.push(v);
+                }
+            }
+        }
+
+        if (!goalReached)
+        {
+            // Collect start's component and goal's component
+            std::vector<int> startComp, goalComp;
+            for (int i = 0; i < n; ++i)
+            {
+                if (visited[i])
+                    startComp.push_back(i);
+            }
+
+            // BFS from goal to find its component
+            std::vector<bool> visitedGoal(n, false);
+            bfsQ.push(goalCi);
+            visitedGoal[goalCi] = true;
+            while (!bfsQ.empty())
+            {
+                int u = bfsQ.front(); bfsQ.pop();
+                goalComp.push_back(u);
+                for (int v : corridor.adjacency[u])
+                {
+                    if (!visitedGoal[v])
+                    {
+                        visitedGoal[v] = true;
+                        bfsQ.push(v);
+                    }
+                }
+            }
+
+            // Find nearest visible pair between components.
+            // Sort by distance, try nearest first. Budget: 200 checks.
+            struct BridgeCand { int ci; int cj; double dist; };
+            std::vector<BridgeCand> bridgeCands;
+
+            // Sample both components to limit O(|C1|×|C2|) cost
+            int stepS = std::max(1, static_cast<int>(startComp.size()) / 200);
+            int stepG = std::max(1, static_cast<int>(goalComp.size()) / 200);
+
+            for (size_t a = 0; a < startComp.size(); a += stepS)
+            {
+                for (size_t b = 0; b < goalComp.size(); b += stepG)
+                {
+                    int ci = startComp[a], cj = goalComp[b];
+                    double d = GSegment::haversineRaw(
+                        lons[ci], lats[ci], lons[cj], lats[cj]);
+                    bridgeCands.push_back({ci, cj, d});
+                }
+            }
+
+            std::sort(bridgeCands.begin(), bridgeCands.end(),
+                      [](const BridgeCand& a, const BridgeCand& b) {
+                          return a.dist < b.dist;
+                      });
+
+            int bridgeChecks = 0;
+            for (const auto& bc : bridgeCands)
+            {
+                if (bridgeChecks >= 200) break;
+                bridgeChecks++;
+                visChecks++;
+                if (isVisible(corridor.vertices[bc.ci],
+                              corridor.vertices[bc.cj], 0))
+                {
+                    addEdge(bc.ci, bc.cj);
+                    mergeEdges++;
+                    fprintf(stderr, "[PHASED] L%d: ocean bridge "
+                            "%.0fkm (%d→%d)\n",
+                            level, bc.dist / 1000.0, bc.ci, bc.cj);
+                    break;  // one bridge is enough
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Phase 4: Start/goal endpoint connectivity
     // ---------------------------------------------------------------
     auto connectEndpoint = [&](int epCi) {
