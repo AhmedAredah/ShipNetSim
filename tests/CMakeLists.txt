@@ -55,8 +55,11 @@ add_shipnetsim_test(HierarchicalVisibilityGraphTest test_hierarchicalvisibilityg
 add_shipnetsim_test(ShortestPathSyntheticTest test_shortestpath_synthetic.cpp)
 add_shipnetsim_test(ShortestPathRealWorldTest test_shortestpath_realworld.cpp)
 add_shipnetsim_test(BenchmarkPaper benchmark_paper.cpp)
-add_shipnetsim_test(BenchmarkFlatVsHier benchmark_flat_vs_hier.cpp)
 add_shipnetsim_test(BenchmarkNoCache benchmark_nocache.cpp)
+add_shipnetsim_test(BenchmarkDiagnose benchmark_diagnose.cpp)
+add_shipnetsim_test(BenchmarkDiagSlow benchmark_diag_slow.cpp)
+add_shipnetsim_test(BenchmarkNoCacheGeoJSON benchmark_nocache_geojson.cpp)
+add_shipnetsim_test(BenchmarkHierOnly benchmark_hier_only.cpp)
 add_shipnetsim_test(BenchmarkNoCacheAllRoutes benchmark_nocache_allroutes.cpp)
 
 # # Real-world tests need longer timeout (HVG build can take several minutes

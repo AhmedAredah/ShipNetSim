@@ -473,11 +473,23 @@ private:
         const std::shared_ptr<GPoint>& snappedStart,
         const std::shared_ptr<GPoint>& snappedGoal);
 
-    void precomputeCorridorAdjacency(
+    /** @brief Build corridor adjacency via corridor-local grid.
+     *
+     *  Phase 1: Ring boundary edges (O(n), zero visibility checks)
+     *  Phase 2: Corridor-local hash grid cross-ring bridges (O(n×k))
+     *  Phase 3: BFS connectivity verification with adaptive expansion
+     *  Phase 4: Start/goal endpoint connectivity
+     *
+     *  Data-adaptive: cell size from mAvgSpacing, works on any dataset.
+     *  All spatial indexing uses corridor-local grid, never the level
+     *  quadtree — avoids O(n_level) overhead for corridor-scale work.
+     */
+    void buildCorridorAdjacencyPhased(
         Corridor& corridor,
         const std::shared_ptr<GPoint>& start,
         const std::shared_ptr<GPoint>& goal,
-        const Corridor* previousCorridor = nullptr,
+        const std::shared_ptr<GPoint>& snappedStart,
+        const std::shared_ptr<GPoint>& snappedGoal,
         int level = 0);
 
     ShortestPathResult hierarchicalSearch(

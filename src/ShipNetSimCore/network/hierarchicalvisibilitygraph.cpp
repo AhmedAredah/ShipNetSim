@@ -1894,13 +1894,17 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal)
 {
-    // If coarse adjacency is cached (from .hvg_adj file), use it globally.
-    // Otherwise, build corridor-local adjacency on demand at each level.
+    // Ensure coarse-level adjacency (L1-L3) is always available.
+    // Without it, corridor guidance degrades to a straight-line tube
+    // from start to goal — which misses routes that detour around
+    // continents. Coarse build is one-time (~14s for 346K vertices).
+    ensureCoarseAdjacency();
     bool hasCoarseAdj = mCoarseAdjReady;
 
     QElapsedTimer hsTimer;
     hsTimer.start();
-    qDebug() << "=== Hierarchical Search ===";
+    fprintf(stderr, "[HS] === Hierarchical Search === coarseAdj=%d\n",
+            hasCoarseAdj ? 1 : 0);
 
     if (!start || !goal)
     {
@@ -1952,6 +1956,8 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                 directGuide.points[0], directGuide.points[1], FastConstruct));
             auto corridor3 = buildCorridor(directGuide, 3,
                                            CORRIDOR_EXPANSION[2]);  // wide
+            buildCorridorAdjacencyPhased(corridor3, start, goal,
+                                         snappedStart, snappedGoal, 3);
             result3 = searchAtLevel(start, goal, 3, &corridor3,
                                     snappedStart, snappedGoal,
                                     false);  // Dijkstra at L3 for optimal guidance
@@ -1973,18 +1979,25 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                             snappedStart, snappedGoal);
     }
     bestCoarseResult = result3;
+    fprintf(stderr, "[HS] L3 done %lldms\n", hsTimer.elapsed());
 
     // --- Level 2 ---
     double expansion2 = CORRIDOR_EXPANSION[2];
     auto corridor2 = buildCorridor(result3, 2, expansion2);
+    if (!hasCoarseAdj)
+        buildCorridorAdjacencyPhased(corridor2, start, goal,
+                                     snappedStart, snappedGoal, 2);
     auto result2 = searchAtLevel(start, goal, 2, &corridor2,
                                 snappedStart, snappedGoal);
     qDebug() << "  L2 corridor:" << corridor2.allowedVertexIndices.size()
              << "verts," << (result2.isValid() ? "valid" : "INVALID")
              << hsTimer.elapsed() << "ms";
 
-    if (!result2.isValid())
+    if (!result2.isValid() && hasCoarseAdj)
     {
+        // Wider retry only when coarse adjacency is cached (cheap).
+        // In no-cache mode, wider corridors add vertices but coarse
+        // polygons miss fine detail — diminishing returns.
         auto widerCorridor2 = buildCorridor(result3, 2, expansion2 * 3.0);
         result2 = searchAtLevel(start, goal, 2, &widerCorridor2,
                                snappedStart, snappedGoal);
@@ -1993,6 +2006,8 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                  << hsTimer.elapsed() << "ms";
     }
 
+    fprintf(stderr, "[HS] L2 %s %lldms\n",
+            result2.isValid() ? "OK" : "FAIL", hsTimer.elapsed());
     if (result2.isValid())
     {
         bestCoarseResult = std::move(result2);
@@ -2001,13 +2016,16 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     // --- Level 1 ---
     double expansion1 = CORRIDOR_EXPANSION[1];
     auto corridor1 = buildCorridor(bestCoarseResult, 1, expansion1);
+    if (!hasCoarseAdj)
+        buildCorridorAdjacencyPhased(corridor1, start, goal,
+                                     snappedStart, snappedGoal, 1);
     auto result1 = searchAtLevel(start, goal, 1, &corridor1,
                                 snappedStart, snappedGoal);
     qDebug() << "  L1 corridor:" << corridor1.allowedVertexIndices.size()
              << "verts," << (result1.isValid() ? "valid" : "INVALID")
              << hsTimer.elapsed() << "ms";
 
-    if (!result1.isValid())
+    if (!result1.isValid() && hasCoarseAdj)
     {
         auto widerCorridor1 = buildCorridor(bestCoarseResult, 1,
                                             expansion1 * 3.0);
@@ -2018,6 +2036,8 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                  << hsTimer.elapsed() << "ms";
     }
 
+    fprintf(stderr, "[HS] L1 %s %lldms\n",
+            result1.isValid() ? "OK" : "FAIL", hsTimer.elapsed());
     if (result1.isValid())
     {
         bestCoarseResult = std::move(result1);
@@ -2091,103 +2111,32 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
     }
     else
     {
-        // Lazy corridor-filtered L0 search with penalty-based
-        // iterative validation. No eager precomputeCorridorAdjacency —
-        // getVisibleNodesForPoint uses the lazy corridor path instead.
-
-        // Ensure snapped start/goal are in L0 vertexIndex for penalty
-        // recording. snapToWater can return the original user point
-        // (in-water case, line 1574) which is NOT a polygon vertex and
-        // NOT in vertexIndex. Without this, penalty validation cannot
-        // penalize edges involving start/goal.
-        {
-            auto& lvl0 = mLevels[0];
-            auto ensureInIndex = [&](const std::shared_ptr<GPoint>& pt) {
-                if (!pt) return;
-                if (lvl0.vertexIndex.find(pt) == lvl0.vertexIndex.end())
-                {
-                    int idx = lvl0.vertices.size();
-                    lvl0.vertices.append(pt);
-                    lvl0.vertexIndex[pt] = idx;
-                }
-            };
-            ensureInIndex(snappedStart);
-            ensureInIndex(snappedGoal);
-        }
-
-        // Validate path edges and penalize bad ones. Uses level vertex
-        // indices (always available) instead of corridor vertex indices
-        // (only exist after precomputeCorridorAdjacency).
-        auto validateAndSearch =
-            [&](Corridor& corr) -> ShortestPathResult
-        {
-            const auto& lvl0 = mLevels[0];
-            ShortestPathResult bestResult;
-            int bestBadCount = std::numeric_limits<int>::max();
-
-            for (int iter = 0; iter < 20; ++iter)
-            {
-                auto result = searchAtLevel(start, goal, 0, &corr,
-                                           snappedStart, snappedGoal);
-                if (!result.isValid()) break;
-
-                int prevSize = static_cast<int>(
-                    corr.penalizedEdges.size());
-                int badCount = 0;
-
-                for (int i = 0; i < result.lines.size(); ++i)
-                {
-                    // Skip short edges (coastline boundary tracing)
-                    if (result.lines[i]->length().value() < 2000.0)
-                        continue;
-
-                    if (!isSegmentVisible(result.lines[i], 0))
-                    {
-                        auto si = lvl0.vertexIndex.find(
-                            result.points[i]);
-                        auto ei = lvl0.vertexIndex.find(
-                            result.points[i + 1]);
-                        if (si != lvl0.vertexIndex.end()
-                            && ei != lvl0.vertexIndex.end())
-                        {
-                            corr.penalizedEdges.insert(
-                                Corridor::edgeKey(si->second,
-                                                  ei->second));
-                        }
-                        badCount++;
-                    }
-                }
-
-                if (badCount < bestBadCount)
-                {
-                    bestResult = result;
-                    bestBadCount = badCount;
-                }
-                if (badCount == 0) break;
-                if (static_cast<int>(corr.penalizedEdges.size())
-                    == prevSize)
-                    break;  // converged
-            }
-            return bestResult;
-        };
-
+        // Build corridor adjacency on-the-fly via corridor-local grid.
+        // All spatial indexing uses a hash grid over corridor vertices,
+        // NOT the level quadtree — avoids O(n_level) overhead.
         auto corridor0 = buildCorridor(bestCoarseResult, 0, expansion0);
-        auto result0 = validateAndSearch(corridor0);
-
+        buildCorridorAdjacencyPhased(corridor0, start, goal,
+                                     snappedStart, snappedGoal, 0);
+        auto result0 = searchAtLevel(start, goal, 0, &corridor0,
+                                     snappedStart, snappedGoal);
         if (result0.isValid())
             return result0;
 
         auto widerCorridor0 = buildCorridor(bestCoarseResult, 0,
                                             expansion0 * 3.0);
-        result0 = validateAndSearch(widerCorridor0);
-
+        buildCorridorAdjacencyPhased(widerCorridor0, start, goal,
+                                     snappedStart, snappedGoal, 0);
+        result0 = searchAtLevel(start, goal, 0, &widerCorridor0,
+                                snappedStart, snappedGoal);
         if (result0.isValid())
             return result0;
 
         auto veryWideCorridor0 = buildCorridor(bestCoarseResult, 0,
                                                expansion0 * 10.0);
-        result0 = validateAndSearch(veryWideCorridor0);
-
+        buildCorridorAdjacencyPhased(veryWideCorridor0, start, goal,
+                                     snappedStart, snappedGoal, 0);
+        result0 = searchAtLevel(start, goal, 0, &veryWideCorridor0,
+                                snappedStart, snappedGoal);
         if (result0.isValid())
             return result0;
     }
@@ -2355,38 +2304,21 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
     return corridor;
 }
 
-void HierarchicalVisibilityGraph::precomputeCorridorAdjacency(
+void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     Corridor& corridor,
     const std::shared_ptr<GPoint>& start,
     const std::shared_ptr<GPoint>& goal,
-    const Corridor* previousCorridor,
+    const std::shared_ptr<GPoint>& snappedStart,
+    const std::shared_ptr<GPoint>& snappedGoal,
     int level)
 {
     const auto& lvl = mLevels[level];
+    QElapsedTimer timer;
+    timer.start();
 
-    // Track which vertices are inherited from the previous corridor
-    int inheritedCount = 0;
-
-    // If we have a previous corridor, carry forward its vertices and adjacency
-    if (previousCorridor && previousCorridor->hasAdjacency)
-    {
-        // Copy all previous corridor vertices first
-        for (int i = 0; i < previousCorridor->vertices.size(); ++i)
-        {
-            corridor.vertices.append(previousCorridor->vertices[i]);
-            corridor.vertexIndex[previousCorridor->vertices[i]] = i;
-        }
-        inheritedCount = corridor.vertices.size();
-
-        // Copy previous adjacency
-        corridor.adjacency.resize(inheritedCount);
-        for (int i = 0; i < inheritedCount; ++i)
-        {
-            corridor.adjacency[i] = previousCorridor->adjacency[i];
-        }
-    }
-
-    // Add new corridor vertices (not already in the corridor)
+    // ---------------------------------------------------------------
+    // Phase 0: Populate corridor vertex arrays
+    // ---------------------------------------------------------------
     for (int idx : corridor.allowedVertexIndices)
     {
         if (idx < lvl.vertices.size())
@@ -2400,83 +2332,439 @@ void HierarchicalVisibilityGraph::precomputeCorridorAdjacency(
         }
     }
 
-    // Add start and goal if not already present
-    auto addIfMissing = [&](const std::shared_ptr<GPoint>& pt) {
+    // Add pre-snapped start/goal (same points used by searchAtLevel)
+    auto addEndpoint = [&](const std::shared_ptr<GPoint>& pt) {
         if (!pt) return;
-        auto snapped = snapToWater(pt, 0);
-        if (!snapped) return;
-        if (corridor.vertexIndex.find(snapped) == corridor.vertexIndex.end())
+        if (corridor.vertexIndex.find(pt) == corridor.vertexIndex.end())
         {
-            corridor.vertexIndex[snapped] = corridor.vertices.size();
-            corridor.vertices.append(snapped);
+            corridor.vertexIndex[pt] = corridor.vertices.size();
+            corridor.vertices.append(pt);
         }
     };
-    addIfMissing(start);
-    addIfMissing(goal);
+    addEndpoint(snappedStart ? snappedStart : start);
+    addEndpoint(snappedGoal ? snappedGoal : goal);
 
     int n = corridor.vertices.size();
     corridor.adjacency.resize(n);
+    if (n == 0) { corridor.hasAdjacency = true; return; }
 
-    if (n == 0)
+    // Build reverse map: level vertex index → corridor vertex index
+    std::unordered_map<int, int> levelToCorridor;
+    levelToCorridor.reserve(n);
+    for (int ci = 0; ci < n; ++ci)
     {
-        corridor.hasAdjacency = true;
-        return;
+        auto it = lvl.vertexIndex.find(corridor.vertices[ci]);
+        if (it != lvl.vertexIndex.end())
+            levelToCorridor[it->second] = ci;
     }
 
-    int newCount = n - inheritedCount;
-    long long totalPairs = static_cast<long long>(n) * (n - 1) / 2;
-    long long inheritedPairs = previousCorridor
-        ? static_cast<long long>(inheritedCount) * (inheritedCount - 1) / 2
-        : 0;
-
-    qDebug() << "Pre-computing corridor adjacency for" << n
-             << "vertices (" << newCount << " new,"
-             << inheritedCount << " inherited,"
-             << (totalPairs - inheritedPairs) << "new pairs)";
-
-    QElapsedTimer timer;
-    timer.start();
-
-    // Only compute visibility for pairs involving at least one new vertex.
-    // Old-old pairs are already in the inherited adjacency.
-    QElapsedTimer progressTimer;
-    progressTimer.start();
-    int completedVertices = 0;
-    qint64 lastProgressEmit = 0;
-    int progressInterval = std::max(1, n / 100);
-
-    for (int i = 0; i < n; ++i)
+    // Pre-extract coordinates (corridor-indexed)
+    std::vector<double> lons(n), lats(n);
+    for (int ci = 0; ci < n; ++ci)
     {
-        // For inherited vertices (i < inheritedCount), only check
-        // against new vertices (j >= inheritedCount).
-        // For new vertices, check against all j > i.
-        int jStart = (i < inheritedCount) ? inheritedCount : (i + 1);
+        lons[ci] = corridor.vertices[ci]->getLongitude().value();
+        lats[ci] = corridor.vertices[ci]->getLatitude().value();
+    }
 
-        for (int j = jStart; j < n; ++j)
+    // Edge dedup
+    std::unordered_set<long long> edgeSet;
+    auto addEdge = [&](int ci, int cj) {
+        if (ci == cj) return;
+        long long key = Corridor::edgeKey(ci, cj);
+        if (edgeSet.insert(key).second)
         {
-            if (isVisible(corridor.vertices[i], corridor.vertices[j], level))
+            corridor.adjacency[ci].push_back(cj);
+            corridor.adjacency[cj].push_back(ci);
+        }
+    };
+
+    // Ring identity lookup for corridor vertices (via level metadata)
+    auto getRingId = [&](int ci) -> long long {
+        auto it = lvl.vertexIndex.find(corridor.vertices[ci]);
+        if (it == lvl.vertexIndex.end()) return -999;
+        int li = it->second;
+        if (li >= static_cast<int>(lvl.vertexPolygonId.size())) return -999;
+        int polyId = lvl.vertexPolygonId[li];
+        int holeId = (li < static_cast<int>(lvl.vertexHoleId.size()))
+                         ? lvl.vertexHoleId[li] : -2;
+        return static_cast<long long>(polyId) * 100000 + holeId;
+    };
+
+    // Pre-compute ring IDs for all corridor vertices
+    std::vector<long long> ringId(n);
+    for (int ci = 0; ci < n; ++ci)
+        ringId[ci] = getRingId(ci);
+
+    // ---------------------------------------------------------------
+    // Phase 1: Boundary edges (O(n), zero visibility checks)
+    // Consecutive ring vertices are always mutually visible.
+    // ---------------------------------------------------------------
+    for (auto& [levelIdx, ci] : levelToCorridor)
+    {
+        auto [prevLi, nextLi] = getRingNeighbors(levelIdx, level);
+        if (prevLi >= 0)
+        {
+            auto pit = levelToCorridor.find(prevLi);
+            if (pit != levelToCorridor.end())
+                addEdge(ci, pit->second);
+        }
+        if (nextLi >= 0)
+        {
+            auto nit = levelToCorridor.find(nextLi);
+            if (nit != levelToCorridor.end())
+                addEdge(ci, nit->second);
+        }
+    }
+    int boundaryEdges = static_cast<int>(edgeSet.size());
+
+    // ---------------------------------------------------------------
+    // Phase 2: Yao-8 visibility shortcuts via corridor-local grid
+    //
+    // Sample every Kth corridor vertex, find nearest CORRIDOR vertex
+    // per octant using the hash grid, check visibility. Produces both
+    // intra-ring express edges (coastline shortcuts) and inter-ring
+    // bridges (water gap crossings) in one pass.
+    //
+    // Grid-based candidate discovery: O(1) per cell lookup — avoids
+    // the 446K-edge level quadtree entirely.
+    // ---------------------------------------------------------------
+    double cellDeg = 5.0 * mAvgSpacing / METERS_PER_DEGREE_LAT;
+    if (cellDeg < 0.01) cellDeg = 0.01;
+    int visChecks = 0;
+
+    // Hash grid: cellKey → list of corridor vertex indices
+    auto cellKey = [&](double lon, double lat) -> long long {
+        int cx = static_cast<int>(std::floor(lon / cellDeg));
+        int cy = static_cast<int>(std::floor(lat / cellDeg));
+        return static_cast<long long>(cy) * 1000000LL + cx;
+    };
+
+    std::unordered_map<long long, std::vector<int>> grid;
+    grid.reserve(n);
+    for (int ci = 0; ci < n; ++ci)
+        grid[cellKey(lons[ci], lats[ci])].push_back(ci);
+
+    // Wrap longitude difference to [-180, 180]
+    auto wrapDLon = [](double dLon) -> double {
+        if (dLon >  180.0) dLon -= 360.0;
+        if (dLon < -180.0) dLon += 360.0;
+        return dLon;
+    };
+    double coneWidth = 2.0 * M_PI / YAO_CONE_COUNT;
+
+    // Sampling rate: every Kth vertex. Adaptive to corridor size.
+    // Small corridors (<200): sample every 10th
+    // Large corridors: sample every EXPRESS_VERTEX_STEP (100)
+    int sampleStep = (n < 200) ? std::max(5, n / 20)
+                                : EXPRESS_VERTEX_STEP;
+
+    // Search radius in grid cells: how far to look for octant candidates.
+    // Proportional to sample step so shortcuts span ~K ring-edges.
+    int searchCells = std::max(3, static_cast<int>(
+        sampleStep * mAvgSpacing / (METERS_PER_DEGREE_LAT * cellDeg)));
+
+    for (int ci = 0; ci < n; ci += sampleStep)
+    {
+        double vLon = lons[ci];
+        double vLat = lats[ci];
+        int vcx = static_cast<int>(std::floor(vLon / cellDeg));
+        int vcy = static_cast<int>(std::floor(vLat / cellDeg));
+
+        // Which octants already covered by existing edges
+        std::array<bool, 8> covered = {};
+        for (int nb : corridor.adjacency[ci])
+        {
+            double dLon = wrapDLon(lons[nb] - vLon);
+            double bearing = std::atan2(dLon, lats[nb] - vLat);
+            if (bearing < 0) bearing += 2.0 * M_PI;
+            covered[static_cast<int>(bearing / coneWidth) % 8] = true;
+        }
+
+        // For each uncovered octant, find nearest corridor vertex via grid
+        std::array<int, 8> bestCi = {};
+        std::array<double, 8> bestDist = {};
+        bestCi.fill(-1);
+        bestDist.fill(std::numeric_limits<double>::max());
+
+        for (int dx = -searchCells; dx <= searchCells; ++dx)
+        {
+            for (int dy = -searchCells; dy <= searchCells; ++dy)
             {
-                corridor.adjacency[i].push_back(j);
-                corridor.adjacency[j].push_back(i);
+                long long key = static_cast<long long>(vcy + dy)
+                                * 1000000LL + (vcx + dx);
+                auto git = grid.find(key);
+                if (git == grid.end()) continue;
+
+                for (int cj : git->second)
+                {
+                    if (cj == ci) continue;
+                    double dLon = wrapDLon(lons[cj] - vLon);
+                    double dLat = lats[cj] - vLat;
+                    double bearing = std::atan2(dLon, dLat);
+                    if (bearing < 0) bearing += 2.0 * M_PI;
+                    int cone = static_cast<int>(bearing / coneWidth) % 8;
+                    if (covered[cone]) continue;
+
+                    double dist = dLon * dLon + dLat * dLat;  // approx
+                    if (dist < bestDist[cone])
+                    {
+                        bestDist[cone] = dist;
+                        bestCi[cone] = cj;
+                    }
+                }
             }
         }
 
-        ++completedVertices;
-        if (completedVertices % progressInterval == 0)
+        // Check visibility for best per octant
+        for (int cone = 0; cone < 8; ++cone)
         {
-            qint64 nowMs = progressTimer.elapsed();
-            if (nowMs - lastProgressEmit >= 1000)
+            if (bestCi[cone] < 0) continue;
+            visChecks++;
+            if (isVisible(corridor.vertices[ci],
+                          corridor.vertices[bestCi[cone]], level))
             {
-                lastProgressEmit = nowMs;
-                emit pathFindingProgress(-1, 0, nowMs / 1000.0);
+                addEdge(ci, bestCi[cone]);
             }
         }
     }
+    int expressEdges = static_cast<int>(edgeSet.size()) - boundaryEdges;
+
+    // ---------------------------------------------------------------
+    // Phase 3: Cross-ring bridges via grid cell scan
+    //
+    // For each grid cell, find the nearest cross-ring pair and bridge
+    // it. Track which ring pairs are already bridged globally to avoid
+    // creating 17-22x redundant bridges (evidence: NY→Colon had 7294
+    // bridges for 326 fragments — only ~326 were needed).
+    auto ringPairKey = [](long long r1, long long r2) -> long long {
+        if (r1 > r2) std::swap(r1, r2);
+        return r1 * 10000000LL + r2;
+    };
+    std::unordered_set<long long> bridgedRingPairs;
+
+    for (auto& [key, cellVerts] : grid)
+    {
+        if (cellVerts.size() < 2) continue;
+
+        // Collect unique rings in this cell
+        std::unordered_map<long long, std::vector<int>> ringGroups;
+        for (int ci : cellVerts)
+            ringGroups[ringId[ci]].push_back(ci);
+
+        if (ringGroups.size() < 2) continue;
+
+        // For each pair of rings in this cell, find the nearest
+        // vertex pair — but only if this ring pair hasn't been bridged.
+        std::vector<std::pair<long long, std::vector<int>*>> rings;
+        for (auto& [rid, verts] : ringGroups)
+            rings.push_back({rid, &verts});
+
+        for (size_t a = 0; a < rings.size(); ++a)
+        {
+            for (size_t b = a + 1; b < rings.size(); ++b)
+            {
+                long long rpk = ringPairKey(rings[a].first,
+                                            rings[b].first);
+                if (bridgedRingPairs.count(rpk)) continue;
+
+                // Find nearest pair between ring a and ring b
+                double bestDist = std::numeric_limits<double>::max();
+                int bestI = -1, bestJ = -1;
+                for (int ci : *rings[a].second)
+                {
+                    for (int cj : *rings[b].second)
+                    {
+                        double d = GSegment::haversineRaw(
+                            lons[ci], lats[ci], lons[cj], lats[cj]);
+                        if (d < bestDist)
+                        {
+                            bestDist = d;
+                            bestI = ci;
+                            bestJ = cj;
+                        }
+                    }
+                }
+
+                if (bestI >= 0)
+                {
+                    visChecks++;
+                    if (isVisible(corridor.vertices[bestI],
+                                  corridor.vertices[bestJ], level))
+                    {
+                        addEdge(bestI, bestJ);
+                        bridgedRingPairs.insert(rpk);
+                    }
+                }
+            }
+        }
+    }
+    int bridgeEdges = static_cast<int>(edgeSet.size()) - boundaryEdges;
+
+    // ---------------------------------------------------------------
+    // Phase 3: Connectivity verification with adaptive expansion
+    //
+    // BFS from start to check if goal is reachable. If not, double
+    // the grid cell size and re-scan for bridges. This guarantees
+    // connectivity while keeping the common case fast.
+    // ---------------------------------------------------------------
+    auto startIt = corridor.vertexIndex.find(
+        snappedStart ? snappedStart : start);
+    auto goalIt = corridor.vertexIndex.find(
+        snappedGoal ? snappedGoal : goal);
+    int startCi = (startIt != corridor.vertexIndex.end())
+                      ? startIt->second : -1;
+    int goalCi = (goalIt != corridor.vertexIndex.end())
+                     ? goalIt->second : -1;
+
+    int mergeEdges = 0;
+    for (int expand = 0; expand < 4; ++expand)
+    {
+        // BFS from start
+        if (startCi < 0 || goalCi < 0) break;
+        std::vector<bool> visited(n, false);
+        std::queue<int> bfsQ;
+        bfsQ.push(startCi);
+        visited[startCi] = true;
+        bool goalReached = false;
+        while (!bfsQ.empty())
+        {
+            int u = bfsQ.front(); bfsQ.pop();
+            if (u == goalCi) { goalReached = true; break; }
+            for (int v : corridor.adjacency[u])
+            {
+                if (!visited[v])
+                {
+                    visited[v] = true;
+                    bfsQ.push(v);
+                }
+            }
+        }
+
+        if (goalReached) break;
+
+        // Not connected — expand grid cell size and re-scan
+        cellDeg *= 2.0;
+        grid.clear();
+        for (int ci = 0; ci < n; ++ci)
+            grid[cellKey(lons[ci], lats[ci])].push_back(ci);
+
+        // Label components for targeted bridging
+        std::vector<int> compId(n, -1);
+        int numComp = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            if (compId[i] >= 0) continue;
+            int cid = numComp++;
+            std::queue<int> q;
+            q.push(i);
+            compId[i] = cid;
+            while (!q.empty())
+            {
+                int u = q.front(); q.pop();
+                for (int v : corridor.adjacency[u])
+                {
+                    if (compId[v] < 0)
+                    {
+                        compId[v] = cid;
+                        q.push(v);
+                    }
+                }
+            }
+        }
+
+        // For each cell with vertices from multiple components,
+        // bridge the nearest cross-component pair
+        for (auto& [key, cellVerts] : grid)
+        {
+            if (cellVerts.size() < 2) continue;
+            // Find nearest cross-component pair in this cell
+            double bestDist = std::numeric_limits<double>::max();
+            int bestI = -1, bestJ = -1;
+            for (size_t a = 0; a < cellVerts.size(); ++a)
+            {
+                for (size_t b = a + 1; b < cellVerts.size(); ++b)
+                {
+                    int ca = cellVerts[a], cb = cellVerts[b];
+                    if (compId[ca] == compId[cb]) continue;
+                    double d = GSegment::haversineRaw(
+                        lons[ca], lats[ca], lons[cb], lats[cb]);
+                    if (d < bestDist)
+                    {
+                        bestDist = d;
+                        bestI = ca;
+                        bestJ = cb;
+                    }
+                }
+            }
+            if (bestI >= 0)
+            {
+                visChecks++;
+                if (isVisible(corridor.vertices[bestI],
+                              corridor.vertices[bestJ], level))
+                {
+                    addEdge(bestI, bestJ);
+                    mergeEdges++;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4: Start/goal endpoint connectivity
+    // ---------------------------------------------------------------
+    auto connectEndpoint = [&](int epCi) {
+        if (epCi < 0 || !corridor.adjacency[epCi].empty()) return;
+
+        // Find nearest corridor vertices by scanning grid neighbors
+        int cx = static_cast<int>(std::floor(lons[epCi] / cellDeg));
+        int cy = static_cast<int>(std::floor(lats[epCi] / cellDeg));
+
+        struct Cand { int ci; double dist; };
+        std::vector<Cand> cands;
+        for (int dx = -2; dx <= 2; ++dx)
+        {
+            for (int dy = -2; dy <= 2; ++dy)
+            {
+                long long key = static_cast<long long>(cy + dy)
+                                * 1000000LL + (cx + dx);
+                auto git = grid.find(key);
+                if (git == grid.end()) continue;
+                for (int cj : git->second)
+                {
+                    if (cj == epCi) continue;
+                    double d = GSegment::haversineRaw(
+                        lons[epCi], lats[epCi], lons[cj], lats[cj]);
+                    cands.push_back({cj, d});
+                }
+            }
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand& a, const Cand& b) {
+                      return a.dist < b.dist;
+                  });
+
+        int found = 0;
+        for (const auto& c : cands)
+        {
+            if (found >= MAX_INJECT_NEIGHBORS) break;
+            visChecks++;
+            if (isVisible(corridor.vertices[epCi],
+                          corridor.vertices[c.ci], level))
+            {
+                addEdge(epCi, c.ci);
+                found++;
+            }
+        }
+    };
+    connectEndpoint(startCi);
+    connectEndpoint(goalCi);
 
     corridor.hasAdjacency = true;
 
-    qDebug() << "Corridor adjacency built in" << timer.elapsed() << "ms"
-             << "(skipped" << inheritedPairs << "inherited pairs)";
+    fprintf(stderr, "[PHASED] L%d: %d verts, %zu edges "
+            "(bound:%d express:%d bridge:%d merge:%d) vis:%d %lldms\n",
+            level, n, edgeSet.size(), boundaryEdges, expressEdges,
+            bridgeEdges, mergeEdges, visChecks, timer.elapsed());
 }
 
 // =============================================================================
