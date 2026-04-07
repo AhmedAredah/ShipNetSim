@@ -2445,6 +2445,142 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
     addEndpoint(snappedStart ? snappedStart : start);
     addEndpoint(snappedGoal ? snappedGoal : goal);
 
+    // ---------------------------------------------------------------
+    // Phase 0.5: Ocean Steiner Point Injection (L0 only)
+    //
+    // Inject coarse path waypoints (and great-circle interpolated
+    // points between distant waypoints) as corridor vertices.
+    // These "ocean Steiner points" sit in open water, enabling
+    // Phase 1b spine edges to bridge disconnected coastline
+    // components that have no line-of-sight between them.
+    // Only at L0: coarser levels already handle connectivity via
+    // containment-only bridges and simplified geometry.
+    // ---------------------------------------------------------------
+    if (level == 0 && corridor.coarseWaypoints.size() >= 2)
+    {
+        const auto& l0Polygons = mLevels[0].polygons;
+
+        // Check if a point is inside water at L0 (full resolution)
+        auto isInWaterL0 = [&](double lon, double lat)
+            -> std::shared_ptr<Polygon>
+        {
+            GPoint testPt(units::angle::degree_t{lon},
+                          units::angle::degree_t{lat});
+            for (const auto& polygon : l0Polygons)
+            {
+                if (polygon->isPointWithinPolygon(testPt))
+                    return polygon;
+            }
+            return nullptr;
+        };
+
+        // Try to inject a point as a corridor vertex
+        auto injectOceanPoint = [&](double lon, double lat,
+                                    const std::shared_ptr<Polygon>& owningPoly)
+        {
+            auto pt = std::make_shared<GPoint>(
+                units::angle::degree_t{lon},
+                units::angle::degree_t{lat},
+                QString("steiner_%1_%2")
+                    .arg(lon, 0, 'f', 3).arg(lat, 0, 'f', 3));
+            pt->addOwningPolygon(owningPoly);
+            if (corridor.vertexIndex.find(pt) == corridor.vertexIndex.end())
+            {
+                corridor.vertexIndex[pt] = corridor.vertices.size();
+                corridor.vertices.append(pt);
+            }
+        };
+
+        double steinerInterval = mLevelMaxDistance[level];
+        int steinerCount = 0;
+
+        for (int w = 0; w < corridor.coarseWaypoints.size(); ++w)
+        {
+            double lon1 = corridor.coarseWaypoints[w]
+                              ->getLongitude().value();
+            double lat1 = corridor.coarseWaypoints[w]
+                              ->getLatitude().value();
+
+            // Inject the waypoint itself if in water
+            auto poly1 = isInWaterL0(lon1, lat1);
+            if (poly1)
+            {
+                injectOceanPoint(lon1, lat1, poly1);
+                steinerCount++;
+            }
+
+            // Interpolate between this waypoint and the next
+            if (w + 1 < corridor.coarseWaypoints.size())
+            {
+                double lon2 = corridor.coarseWaypoints[w + 1]
+                                  ->getLongitude().value();
+                double lat2 = corridor.coarseWaypoints[w + 1]
+                                  ->getLatitude().value();
+                double dist = GSegment::haversineRaw(
+                    lon1, lat1, lon2, lat2);
+
+                if (dist > steinerInterval)
+                {
+                    int numSteps = static_cast<int>(
+                        std::ceil(dist / steinerInterval));
+
+                    // Great circle interpolation (slerp)
+                    double lat1r = lat1 * M_PI / 180.0;
+                    double lon1r = lon1 * M_PI / 180.0;
+                    double lat2r = lat2 * M_PI / 180.0;
+                    double lon2r = lon2 * M_PI / 180.0;
+                    double d = 2.0 * std::asin(std::sqrt(
+                        std::pow(std::sin((lat2r - lat1r) / 2.0), 2)
+                        + std::cos(lat1r) * std::cos(lat2r)
+                        * std::pow(std::sin((lon2r - lon1r) / 2.0),
+                                   2)));
+
+                    if (d > 1e-10)
+                    {
+                        for (int s = 1; s < numSteps; ++s)
+                        {
+                            double f = static_cast<double>(s) / numSteps;
+                            double A = std::sin((1.0 - f) * d)
+                                       / std::sin(d);
+                            double B = std::sin(f * d) / std::sin(d);
+                            double x = A * std::cos(lat1r)
+                                           * std::cos(lon1r)
+                                     + B * std::cos(lat2r)
+                                           * std::cos(lon2r);
+                            double y = A * std::cos(lat1r)
+                                           * std::sin(lon1r)
+                                     + B * std::cos(lat2r)
+                                           * std::sin(lon2r);
+                            double z = A * std::sin(lat1r)
+                                     + B * std::sin(lat2r);
+                            double latI = std::atan2(
+                                z, std::sqrt(x * x + y * y))
+                                * 180.0 / M_PI;
+                            double lonI = std::atan2(y, x)
+                                * 180.0 / M_PI;
+
+                            auto polyI = isInWaterL0(lonI, latI);
+                            if (polyI)
+                            {
+                                injectOceanPoint(lonI, latI, polyI);
+                                steinerCount++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (steinerCount > 0)
+        {
+            fprintf(stderr, "[STEINER] L%d: injected %d ocean points "
+                    "from %lld coarse waypoints\n",
+                    level, steinerCount,
+                    static_cast<long long>(
+                        corridor.coarseWaypoints.size()));
+        }
+    }
+
     int n = corridor.vertices.size();
     corridor.adjacency.resize(n);
     if (n == 0) { corridor.hasAdjacency = true; return; }
@@ -2577,10 +2713,18 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 wp->getLongitude().value(), wp->getLatitude().value()));
         }
 
-        // Connect consecutive waypoint neighborhoods with visibility
+        // Connect consecutive waypoint neighborhoods with visibility.
+        // When visibility fails for ALL candidates, add a containment-
+        // only penalized edge (same mechanism as Phase 3c ocean bridges).
+        // This bridges disconnected components through island chains
+        // where no line-of-sight exists at L0 resolution.
+        int spinePenalized = 0;
         for (int w = 0; w + 1 < static_cast<int>(wpNearest.size()); ++w)
         {
             bool bridged = false;
+            int bestA = -1, bestB = -1;
+            double bestDist = std::numeric_limits<double>::max();
+
             for (int a : wpNearest[w])
             {
                 for (int b : wpNearest[w + 1])
@@ -2598,8 +2742,41 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                         spineEdges++;
                         bridged = true;
                     }
+                    else
+                    {
+                        // Track best candidate for containment fallback
+                        double d = GSegment::haversineRaw(
+                            lons[a], lats[a], lons[b], lats[b]);
+                        if (d < bestDist)
+                        {
+                            bestDist = d;
+                            bestA = a;
+                            bestB = b;
+                        }
+                    }
                 }
-                if (bridged) break;  // one bridge per waypoint pair
+                if (bridged) break;
+            }
+
+            // Fallback: containment-only penalized edge (L0 only).
+            // At coarser levels, Phase 3c bridges handle connectivity.
+            if (!bridged && bestA >= 0 && level == 0)
+            {
+                addEdge(bestA, bestB);
+                // Map corridor indices to level indices for penalty key
+                auto aiIt = lvl.vertexIndex.find(
+                    corridor.vertices[bestA]);
+                auto biIt = lvl.vertexIndex.find(
+                    corridor.vertices[bestB]);
+                if (aiIt != lvl.vertexIndex.end()
+                    && biIt != lvl.vertexIndex.end())
+                {
+                    corridor.penalizedEdges.insert(
+                        Corridor::edgeKey(aiIt->second,
+                                          biIt->second));
+                }
+                spineEdges++;
+                spinePenalized++;
             }
         }
     }
@@ -3238,6 +3415,12 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                             for (int i = 0; i < n; ++i)
                                 if (compId[i] == oldComp)
                                     compId[i] = newComp;
+                            // Update compVerts to reflect the merge
+                            // (prevents re-discovering same bridge)
+                            for (int v : compVerts[oldComp])
+                                compVerts[newComp].push_back(v);
+                            compVerts[oldComp].clear();
+                            startCompId = compId[startCi];
                             hopBridged = true;
                             fprintf(stderr, "[PHASE3c] L%d: multi-hop "
                                     "bridge %.0fkm (%d→%d) after %d "
