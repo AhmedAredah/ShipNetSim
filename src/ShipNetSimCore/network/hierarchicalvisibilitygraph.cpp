@@ -2961,6 +2961,11 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                           return a.dist < b.dist;
                       });
 
+            // For ocean bridges at coarse levels (L1-L3), use level-
+            // appropriate visibility. Small islands simplified away at
+            // L2 should not block corridor connectivity. The L0 path
+            // validation ensures the final path is water-safe.
+            int visLevel = (level > 0) ? level : 0;
             int maxBridgeChecks = std::max(500,
                 static_cast<int>(bridgeCands.size() / 2));
             int bridgeChecks = 0;
@@ -2971,7 +2976,7 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 bridgeChecks++;
                 visChecks++;
                 if (isVisible(corridor.vertices[bc.ci],
-                              corridor.vertices[bc.cj], 0))
+                              corridor.vertices[bc.cj], visLevel))
                 {
                     addEdge(bc.ci, bc.cj);
                     mergeEdges++;
@@ -3082,35 +3087,74 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                         }
                     }
 
-                    if (bestA >= 0)
+                    if (bestA < 0) break;
+
+                    // Try K nearest cross-component pairs, not just
+                    // the nearest. Islands create pairs on opposite
+                    // sides, but gaps between islands provide visible
+                    // connections.
+                    struct MCand { int ci; int cj; double dist; };
+                    std::vector<MCand> mCands;
+                    for (size_t a = 0;
+                         a < compVerts[startCompId].size(); a += stepA)
                     {
-                        visChecks++;
-                        if (isVisible(corridor.vertices[bestA],
-                                      corridor.vertices[bestB], 0))
+                        int ci = compVerts[startCompId][a];
+                        for (int c = 0; c < numComp; ++c)
                         {
-                            addEdge(bestA, bestB);
+                            if (c == startCompId) continue;
+                            int sB = std::max(1, static_cast<int>(
+                                compVerts[c].size()) / 100);
+                            for (size_t b = 0;
+                                 b < compVerts[c].size(); b += sB)
+                            {
+                                int cj = compVerts[c][b];
+                                double d = GSegment::haversineRaw(
+                                    lons[ci], lats[ci],
+                                    lons[cj], lats[cj]);
+                                mCands.push_back({ci, cj, d});
+                            }
+                        }
+                    }
+                    std::sort(mCands.begin(), mCands.end(),
+                              [](const MCand& a, const MCand& b) {
+                                  return a.dist < b.dist;
+                              });
+
+                    bool hopBridged = false;
+                    int hopChecks = 0;
+                    int maxHopChecks = std::max(500,
+                        static_cast<int>(mCands.size() / 4));
+                    for (const auto& mc : mCands)
+                    {
+                        if (hopChecks >= maxHopChecks) break;
+                        hopChecks++;
+                        visChecks++;
+                        if (isVisible(corridor.vertices[mc.ci],
+                                      corridor.vertices[mc.cj],
+                                      visLevel))
+                        {
+                            addEdge(mc.ci, mc.cj);
                             mergeEdges++;
-                            // Update component IDs
-                            int oldComp = compId[bestB];
-                            int newComp = compId[bestA];
+                            int oldComp = compId[mc.cj];
+                            int newComp = compId[mc.ci];
                             for (int i = 0; i < n; ++i)
                                 if (compId[i] == oldComp)
                                     compId[i] = newComp;
+                            hopBridged = true;
                             fprintf(stderr, "[PHASE3c] L%d: multi-hop "
-                                    "bridge %.0fkm (%d→%d)\n",
-                                    level, bestD / 1000.0, bestA, bestB);
+                                    "bridge %.0fkm (%d→%d) after %d "
+                                    "checks\n", level,
+                                    mc.dist / 1000.0, mc.ci, mc.cj,
+                                    hopChecks);
+                            break;
                         }
-                        else
-                        {
-                            // Not visible — skip vis and just connect
-                            // (for corridor guidance, approximate is OK)
-                            // Actually NO — L0 paths must be in water.
-                            // Try next nearest pair
-                            fprintf(stderr, "[PHASE3c] L%d: nearest pair "
-                                    "%.0fkm NOT visible\n",
-                                    level, bestD / 1000.0);
-                            break;  // give up on this route
-                        }
+                    }
+                    if (!hopBridged)
+                    {
+                        fprintf(stderr, "[PHASE3c] L%d: nearest pair "
+                                "%.0fkm NOT visible after %d checks\n",
+                                level, bestD / 1000.0, hopChecks);
+                        break;
                     }
                 }
             }
