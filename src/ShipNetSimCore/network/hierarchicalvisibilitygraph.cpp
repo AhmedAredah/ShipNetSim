@@ -2269,15 +2269,56 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
         corridor.maxLon =  180.0;
     }
 
-    // Use tube filtering only when enabled and coarse path has 3+ waypoints
-    // (curved route). For 2-point paths (direct line), the tube would
-    // be too narrow for routes that need to detour around land.
-    // Disabled at L0 (useTubeFilter=false) because coarse paths may cut
-    // through land due to missing holes at simplified levels.
-    bool useTube = useTubeFilter && (coarsePath.points.size() >= 3);
-
+    // Use tube filtering when enabled and coarse path has 3+ waypoints.
+    // For 2-point paths that span wide corridors (>180° longitude),
+    // interpolate great circle waypoints to enable tube filtering.
+    // Without this, transpacific corridors capture ALL vertices in the
+    // latitude band (70K+ vertices across every Pacific island chain).
+    // Great circle interpolation restricts to a narrow tube around the
+    // actual route (e.g., North Pacific at 40-50°N).
     std::vector<double> wpLons, wpLats;
-    if (useTube)
+
+    if (coarsePath.points.size() == 2
+        && corridor.maxLon - corridor.minLon > 180.0)
+    {
+        // Interpolate great circle waypoints every ~1000km
+        double lon1 = coarsePath.points[0]->getLongitude().value();
+        double lat1 = coarsePath.points[0]->getLatitude().value();
+        double lon2 = coarsePath.points[1]->getLongitude().value();
+        double lat2 = coarsePath.points[1]->getLatitude().value();
+        double dist = GSegment::haversineRaw(lon1, lat1, lon2, lat2);
+        int numSteps = std::max(2, static_cast<int>(dist / 1000000.0));
+
+        // Convert to radians for great circle interpolation
+        double lat1r = lat1 * M_PI / 180.0;
+        double lon1r = lon1 * M_PI / 180.0;
+        double lat2r = lat2 * M_PI / 180.0;
+        double lon2r = lon2 * M_PI / 180.0;
+        double d = 2.0 * std::asin(std::sqrt(
+            std::pow(std::sin((lat2r - lat1r) / 2.0), 2) +
+            std::cos(lat1r) * std::cos(lat2r) *
+            std::pow(std::sin((lon2r - lon1r) / 2.0), 2)));
+
+        wpLons.reserve(numSteps + 1);
+        wpLats.reserve(numSteps + 1);
+        for (int i = 0; i <= numSteps; ++i)
+        {
+            double f = static_cast<double>(i) / numSteps;
+            double A = std::sin((1.0 - f) * d) / std::sin(d);
+            double B = std::sin(f * d) / std::sin(d);
+            double x = A * std::cos(lat1r) * std::cos(lon1r)
+                     + B * std::cos(lat2r) * std::cos(lon2r);
+            double y = A * std::cos(lat1r) * std::sin(lon1r)
+                     + B * std::cos(lat2r) * std::sin(lon2r);
+            double z = A * std::sin(lat1r) + B * std::sin(lat2r);
+            double latI = std::atan2(z, std::sqrt(x*x + y*y))
+                          * 180.0 / M_PI;
+            double lonI = std::atan2(y, x) * 180.0 / M_PI;
+            wpLons.push_back(lonI);
+            wpLats.push_back(latI);
+        }
+    }
+    else if (useTubeFilter && coarsePath.points.size() >= 3)
     {
         wpLons.reserve(coarsePath.points.size());
         wpLats.reserve(coarsePath.points.size());
@@ -2287,6 +2328,8 @@ Corridor HierarchicalVisibilityGraph::buildCorridor(
             wpLats.push_back(wp->getLatitude().value());
         }
     }
+
+    bool useTube = !wpLons.empty();
 
     // Populate allowed vertex indices via quadtree range query,
     // with optional per-waypoint tube filter for curved routes.
@@ -3012,10 +3055,33 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 {
                     addEdge(bc.ci, bc.cj);
                     mergeEdges++;
+                    // Penalize containment-only bridges so coarse A*
+                    // minimizes their use. The path should follow water
+                    // edges and only use the bridge when no other path
+                    // exists. This prevents coarse paths from cutting
+                    // through land, which would corrupt L0 corridor
+                    // guidance.
+                    if (useContainmentOnly)
+                    {
+                        // Map corridor indices to level indices for
+                        // the penalizedEdges key
+                        auto ciIt = lvl.vertexIndex.find(
+                            corridor.vertices[bc.ci]);
+                        auto cjIt = lvl.vertexIndex.find(
+                            corridor.vertices[bc.cj]);
+                        if (ciIt != lvl.vertexIndex.end()
+                            && cjIt != lvl.vertexIndex.end())
+                        {
+                            corridor.penalizedEdges.insert(
+                                Corridor::edgeKey(ciIt->second,
+                                                  cjIt->second));
+                        }
+                    }
                     bridged = true;
                     fprintf(stderr, "[PHASE3c] L%d: ocean bridge "
-                            "%.0fkm (%d→%d)\n",
-                            level, bc.dist / 1000.0, bc.ci, bc.cj);
+                            "%.0fkm (%d→%d)%s\n",
+                            level, bc.dist / 1000.0, bc.ci, bc.cj,
+                            useContainmentOnly ? " [penalized]" : "");
                     break;
                 }
             }
