@@ -1870,7 +1870,10 @@ ShortestPathResult HierarchicalVisibilityGraph::searchAtLevel(
 
     if (cameFrom[endIdx] == -1 && startIdx != endIdx)
     {
-        qDebug() << "A* level" << level << ": no path found";
+        fprintf(stderr, "[A*] L%d FAIL: expanded=%d, indexed=%lld, "
+                "startIdx=%d endIdx=%d\n",
+                level, expandedCount,
+                (long long)idxToPoint.size(), startIdx, endIdx);
         return ShortestPathResult();
     }
 
@@ -2167,11 +2170,21 @@ ShortestPathResult HierarchicalVisibilityGraph::hierarchicalSearch(
                                                expansion0 * 10.0);
         buildCorridorAdjacencyPhased(veryWideCorridor0, start, goal,
                                      snappedStart, snappedGoal, 0);
-        // Budget: 3× corridor size. If A* can't find a path within
-        // this many expansions, the corridor is too boundary-heavy.
-        // Fall through to unconstrained L0 instead of running forever.
-        int corridorBudget = static_cast<int>(
-            veryWideCorridor0.allowedVertexIndices.size()) * 3;
+        // No expansion budget for 10x corridor — it's the last resort
+        // before unconstrained L0. Let A* run to completion.
+        int corridorBudget = -1;
+        {
+            auto sit = veryWideCorridor0.vertexIndex.find(
+                snappedStart ? snappedStart : start);
+            auto git = veryWideCorridor0.vertexIndex.find(
+                snappedGoal ? snappedGoal : goal);
+            fprintf(stderr, "[HS] L0 10x: start_in_corridor=%d "
+                    "goal_in_corridor=%d corridor_verts=%d edges=%zu\n",
+                    sit != veryWideCorridor0.vertexIndex.end() ? 1 : 0,
+                    git != veryWideCorridor0.vertexIndex.end() ? 1 : 0,
+                    veryWideCorridor0.vertices.size(),
+                    veryWideCorridor0.adjacency.size());
+        }
         fprintf(stderr, "[HS] L0 10x A* budget=%d starting...\n",
                 corridorBudget);
         result0 = searchAtLevel(start, goal, 0, &veryWideCorridor0,
@@ -2590,10 +2603,11 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
 
     // Sample density proportional to corridor size. The cached build
     // checks every vertex (sampleStep=1), but vis checks cost ~1-5ms.
-    // Target: ~1 express edge per 5 corridor vertices for adequate
-    // A* shortcutting. Minimum budget 3000, scaling with corridor size.
-    // For 27K verts: budget=5400 → step=40 → 675 samples → ~2K express.
-    int maxVisChecks = std::max(3000, n / 5);
+    // Target: ~1 express edge per corridor vertex for A* shortcutting.
+    // Minimum budget 3000. Vis checks cost ~0.2ms each, so for 27K
+    // corridor: 27K checks × 0.2ms = 5.4s Phase 2 time. Acceptable
+    // since this only runs for large fallback corridors.
+    int maxVisChecks = std::max(3000, n);
     int sampleStep = std::max(1, (n * 8) / maxVisChecks);
 
     // Search radius matching the cached build:
@@ -2889,6 +2903,11 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
             }
         }
 
+        fprintf(stderr, "[PHASE3c] L%d: startCi=%d goalCi=%d "
+                "goalReached=%d startCompSize=%d\n",
+                level, startCi, goalCi, goalReached ? 1 : 0,
+                static_cast<int>(std::count(visited.begin(),
+                                            visited.end(), true)));
         if (!goalReached)
         {
             // Collect start's component and goal's component
@@ -2942,10 +2961,13 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                           return a.dist < b.dist;
                       });
 
+            int maxBridgeChecks = std::max(500,
+                static_cast<int>(bridgeCands.size() / 2));
             int bridgeChecks = 0;
+            bool bridged = false;
             for (const auto& bc : bridgeCands)
             {
-                if (bridgeChecks >= 200) break;
+                if (bridgeChecks >= maxBridgeChecks) break;
                 bridgeChecks++;
                 visChecks++;
                 if (isVisible(corridor.vertices[bc.ci],
@@ -2953,10 +2975,143 @@ void HierarchicalVisibilityGraph::buildCorridorAdjacencyPhased(
                 {
                     addEdge(bc.ci, bc.cj);
                     mergeEdges++;
-                    fprintf(stderr, "[PHASED] L%d: ocean bridge "
+                    bridged = true;
+                    fprintf(stderr, "[PHASE3c] L%d: ocean bridge "
                             "%.0fkm (%d→%d)\n",
                             level, bc.dist / 1000.0, bc.ci, bc.cj);
-                    break;  // one bridge is enough
+                    break;
+                }
+            }
+
+            if (!bridged)
+            {
+                fprintf(stderr, "[PHASE3c] L%d: NO direct bridge "
+                        "found after %d checks. Trying multi-hop...\n",
+                        level, bridgeChecks);
+
+                // Multi-hop: bridge start's component to nearest
+                // UNVISITED component, then repeat until goal reached.
+                // This handles paths like Africa→Madagascar→India.
+                std::vector<int> compId(n, -1);
+                int numComp = 0;
+                for (int i = 0; i < n; ++i)
+                {
+                    if (compId[i] >= 0) continue;
+                    int cid = numComp++;
+                    std::queue<int> q;
+                    q.push(i);
+                    compId[i] = cid;
+                    while (!q.empty())
+                    {
+                        int u = q.front(); q.pop();
+                        for (int v : corridor.adjacency[u])
+                        {
+                            if (compId[v] < 0)
+                            {
+                                compId[v] = cid;
+                                q.push(v);
+                            }
+                        }
+                    }
+                }
+                fprintf(stderr, "[PHASE3c] L%d: %d components\n",
+                        level, numComp);
+
+                // For each pair of components, find nearest visible pair
+                // Group vertices by component
+                std::vector<std::vector<int>> compVerts(numComp);
+                for (int i = 0; i < n; ++i)
+                    compVerts[compId[i]].push_back(i);
+
+                // Greedy: bridge the two nearest components repeatedly
+                for (int iter = 0; iter < numComp && iter < 20; ++iter)
+                {
+                    // Re-check connectivity
+                    std::vector<bool> vis2(n, false);
+                    std::queue<int> q2;
+                    q2.push(startCi);
+                    vis2[startCi] = true;
+                    bool reached = false;
+                    while (!q2.empty())
+                    {
+                        int u = q2.front(); q2.pop();
+                        if (u == goalCi) { reached = true; break; }
+                        for (int v : corridor.adjacency[u])
+                        {
+                            if (!vis2[v])
+                            {
+                                vis2[v] = true;
+                                q2.push(v);
+                            }
+                        }
+                    }
+                    if (reached) { bridged = true; break; }
+
+                    // Find nearest cross-component pair from start's
+                    // component to ANY other component
+                    int startCompId = compId[startCi];
+                    double bestD = std::numeric_limits<double>::max();
+                    int bestA = -1, bestB = -1;
+                    int stepA = std::max(1, static_cast<int>(
+                        compVerts[startCompId].size()) / 100);
+
+                    for (size_t a = 0;
+                         a < compVerts[startCompId].size(); a += stepA)
+                    {
+                        int ci = compVerts[startCompId][a];
+                        // Check against all other components
+                        for (int c = 0; c < numComp; ++c)
+                        {
+                            if (c == startCompId) continue;
+                            int stepB = std::max(1, static_cast<int>(
+                                compVerts[c].size()) / 100);
+                            for (size_t b = 0;
+                                 b < compVerts[c].size(); b += stepB)
+                            {
+                                int cj = compVerts[c][b];
+                                double d = GSegment::haversineRaw(
+                                    lons[ci], lats[ci],
+                                    lons[cj], lats[cj]);
+                                if (d < bestD)
+                                {
+                                    bestD = d;
+                                    bestA = ci;
+                                    bestB = cj;
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestA >= 0)
+                    {
+                        visChecks++;
+                        if (isVisible(corridor.vertices[bestA],
+                                      corridor.vertices[bestB], 0))
+                        {
+                            addEdge(bestA, bestB);
+                            mergeEdges++;
+                            // Update component IDs
+                            int oldComp = compId[bestB];
+                            int newComp = compId[bestA];
+                            for (int i = 0; i < n; ++i)
+                                if (compId[i] == oldComp)
+                                    compId[i] = newComp;
+                            fprintf(stderr, "[PHASE3c] L%d: multi-hop "
+                                    "bridge %.0fkm (%d→%d)\n",
+                                    level, bestD / 1000.0, bestA, bestB);
+                        }
+                        else
+                        {
+                            // Not visible — skip vis and just connect
+                            // (for corridor guidance, approximate is OK)
+                            // Actually NO — L0 paths must be in water.
+                            // Try next nearest pair
+                            fprintf(stderr, "[PHASE3c] L%d: nearest pair "
+                                    "%.0fkm NOT visible\n",
+                                    level, bestD / 1000.0);
+                            break;  // give up on this route
+                        }
+                    }
                 }
             }
         }
