@@ -2537,18 +2537,20 @@ void Ship::sail(
             auto port = SeaPortLoader::getClosestPortToPoint(
                 nextStoppingPoint);
 
+            QString physicalPortId;
             QPair<QString, qsizetype> containersCount = {"", 0};
             if (port)
             {
 
                 QString portID   = port->getPortCode();
                 QString portName = port->getPortName();
+                physicalPortId = portID.isEmpty() ? portName : portID;
 
                 containersCount =
                     countContainersLeavingAtPort({portID, portName});
             }
 
-            emit reachedSeaPort(getUserID(), containersCount.first,
+            emit reachedSeaPort(getUserID(), physicalPortId,
                                 containersCount.second);
         }
 
@@ -2942,6 +2944,23 @@ QJsonObject Ship::getCurrentStateAsJson() const
     posJson["position"] = xyPosition;
     json["position"]    = posJson;
 
+    if (!mPathPoints.isEmpty())
+    {
+        const auto &destination = mPathPoints.back();
+        QJsonObject destinationJson;
+        destinationJson["latitude"] =
+            destination->getLatitude().value();
+        destinationJson["longitude"] =
+            destination->getLongitude().value();
+        QJsonArray destinationPosition;
+        destinationPosition.append(
+            destination->getLatitude().value());
+        destinationPosition.append(
+            destination->getLongitude().value());
+        destinationJson["position"] = destinationPosition;
+        json["destinationPosition"] = destinationJson;
+    }
+
     // Environment conditions
     QJsonObject envJson;
     envJson["waterDepth"] =
@@ -2995,8 +3014,10 @@ Ship::countContainersLeavingAtPort(const QVector<QString> &portNames)
     // Check each port until we find containers
     for (const QString &portName : portNames)
     {
-        count = mLoadedContainers.countContainersByNextDestination(
-            portName);
+        ContainerCore::ContainerSelectionCriteria criteria;
+        criteria.nextDestination = portName;
+
+        count = mLoadedContainers.countContainers(criteria);
         if (count != 0)
         {
             return {portName, count};
@@ -3055,9 +3076,11 @@ Ship::getContainersLeavingAtPort(const QVector<QString> &portNames)
     // Check each port until we find containers
     for (const QString &portName : portNames)
     {
+        ContainerCore::ContainerSelectionCriteria criteria;
+        criteria.nextDestination = portName;
+
         auto containers =
-            mLoadedContainers.dequeueContainersByNextDestination(
-                portName);
+            mLoadedContainers.dequeueContainers(criteria);
         if (!containers.isEmpty())
         {
             return {portName, containers};

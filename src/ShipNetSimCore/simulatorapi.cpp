@@ -1933,19 +1933,31 @@ void SimulatorAPI::requestRunSimulation(
         networkNames = apiDataMap.getNetworkNames();
     }
 
-    // Iterate over each network name
+    // Validate the full request before mutating tracker state
+    // or dispatching work to any simulator thread.
     for (const auto &networkName : networkNames)
     {
-        // Check if the network exists in the thread-safe map
         if (!apiDataMap.contains(networkName))
         {
             emit errorOccurred("A network with name " + networkName
                                + " does not exist!");
             return;
         }
+    }
 
-        mReachedDesTracker.setRequestedNetworks(networkNames);
+    // Seed the trackers once per interactive run request.
+    // `simulationReachedReportingTime` feeds
+    // `handleOneTimeStepCompleted()`, which aggregates on
+    // mTimeStepTracker before emitting simulationAdvanced.
+    mTimeStepTracker.clearAll();
+    mTimeStepTracker.setRequestedNetworks(networkNames);
 
+    mReachedDesTracker.resetCompletedRequests();
+    mReachedDesTracker.setRequestedNetworks(networkNames);
+
+    // Iterate over each network name
+    for (const auto &networkName : networkNames)
+    {
         // Retrieve the APIData for the specified network
         APIData apiData = apiDataMap.get(networkName);
 
@@ -1968,9 +1980,6 @@ void SimulatorAPI::requestRunSimulation(
             }
         }
     }
-
-    mReachedDesTracker.resetCompletedRequests();
-    mReachedDesTracker.setRequestedNetworks(networkNames);
 }
 
 void SimulatorAPI::finalizeSimulation(QVector<QString> networkNames)
@@ -1998,15 +2007,7 @@ void SimulatorAPI::finalizeSimulation(QVector<QString> networkNames)
         // Check if the simulator exists
         if (apiData.simulator)
         {
-            // Invoke the finalizeSimulation method on the simulator
-            bool success = QMetaObject::invokeMethod(
-                apiData.simulator, "finalizeSimulation",
-                mConnectionType);
-
-            if (!success)
-            {
-                qWarning() << "Failed to invoke finalizeSimulation";
-            }
+            apiData.simulator->finalizeSimulation();
         }
     }
 }

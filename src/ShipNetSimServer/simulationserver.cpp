@@ -2,12 +2,15 @@
 #include "./VersionConfig.h"
 #include "simulatorapi.h"
 #include "utils/serverutils.h"
+#include <atomic>
+#include <QDateTime>
 #include <QDebug>
 #include <QDomDocument>
 #include <QEventLoop>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QThread>
 #include <containerLib/container.h>
 #ifdef HAVE_QTKEYCHAIN
 #include <qt6keychain/keychain.h>
@@ -29,8 +32,342 @@ static const std::string RECEIVING_ROUTING_KEY =
     "CargoNetSim.Command.ShipNetSim";
 static const std::string PUBLISHING_ROUTING_KEY =
     "CargoNetSim.Response.ShipNetSim";
+static const std::string HEALTH_COMMAND_QUEUE_NAME =
+    "CargoNetSim.CommandQueue.ShipNetSim.Health";
+static const std::string HEALTH_RESPONSE_QUEUE_NAME =
+    "CargoNetSim.ResponseQueue.ShipNetSim.Health";
+static const std::string HEALTH_RECEIVING_ROUTING_KEY =
+    "CargoNetSim.Command.Health.ShipNetSim";
+static const std::string HEALTH_PUBLISHING_ROUTING_KEY =
+    "CargoNetSim.Response.Health.ShipNetSim";
 
 static const int MAX_SEND_COMMAND_RETRIES = 3;
+
+namespace
+{
+
+QString resolveReplyRoutingKey(const QJsonObject &message,
+                               const QString &fallbackRoutingKey)
+{
+    return message.value("replyRoutingKey")
+        .toString(fallbackRoutingKey);
+}
+
+} // namespace
+
+class ShipNetSimHealthControlPlane final : public QThread
+{
+public:
+    ShipNetSimHealthControlPlane(const std::string &hostname,
+                                 int                port,
+                                 const QString     &username,
+                                 const QString     &password,
+                                 QObject           *parent = nullptr)
+        : QThread(parent)
+        , mHostname(hostname)
+        , mPort(port)
+        , mUsername(username)
+        , mPassword(password)
+    {
+    }
+
+    ~ShipNetSimHealthControlPlane() override
+    {
+        stopAndWait();
+    }
+
+    void stopAndWait()
+    {
+        mStopRequested.store(true);
+        requestInterruption();
+        if (isRunning())
+            wait();
+        cleanupConnection();
+    }
+
+protected:
+    void run() override
+    {
+        while (!mStopRequested.load() && !isInterruptionRequested())
+        {
+            if (!connectIfNeeded())
+            {
+                if (mStopRequested.load()
+                    || isInterruptionRequested())
+                {
+                    break;
+                }
+
+                QThread::sleep(RECONNECT_DELAY_SECONDS);
+                continue;
+            }
+
+            qInfo() << "Health control plane initialized successfully. Awaiting"
+                       " health commands from"
+                    << mHostname.c_str() << ":" << mPort;
+
+            consumeLoop();
+            cleanupConnection();
+
+            if (!mStopRequested.load()
+                && !isInterruptionRequested())
+            {
+                qDebug() << "Attempting to reconnect RabbitMQ health lane...";
+                QThread::sleep(RECONNECT_DELAY_SECONDS);
+            }
+        }
+    }
+
+private:
+    bool connectIfNeeded()
+    {
+        cleanupConnection();
+
+        mConnection = amqp_new_connection();
+        amqp_socket_t *socket = amqp_tcp_socket_new(mConnection);
+        if (!socket)
+        {
+            qCritical() << "Error: Unable to create RabbitMQ health socket.";
+            cleanupConnection();
+            return false;
+        }
+
+        const int status =
+            amqp_socket_open(socket, mHostname.c_str(), mPort);
+        if (status != AMQP_STATUS_OK)
+        {
+            qCritical() << "Error: Failed to open RabbitMQ health socket on"
+                        << mHostname.c_str() << ":" << mPort;
+            cleanupConnection();
+            return false;
+        }
+
+        const amqp_rpc_reply_t loginRes =
+            amqp_login(mConnection, "/", 0, 131072, 0,
+                       AMQP_SASL_METHOD_PLAIN,
+                       mUsername.toStdString().c_str(),
+                       mPassword.toStdString().c_str());
+        if (loginRes.reply_type != AMQP_RESPONSE_NORMAL)
+        {
+            qCritical() << "Error: RabbitMQ health login failed.";
+            cleanupConnection();
+            return false;
+        }
+
+        amqp_channel_open(mConnection, 1);
+        if (amqp_get_rpc_reply(mConnection).reply_type
+            != AMQP_RESPONSE_NORMAL)
+        {
+            qCritical() << "Error: Unable to open RabbitMQ health channel.";
+            cleanupConnection();
+            return false;
+        }
+
+        if (!amqp_exchange_declare(
+                mConnection, 1,
+                amqp_cstring_bytes(EXCHANGE_NAME.c_str()),
+                amqp_cstring_bytes("topic"), 0, 1, 0, 0,
+                amqp_empty_table))
+        {
+            qCritical() << "Error: Unable to declare RabbitMQ health exchange.";
+            cleanupConnection();
+            return false;
+        }
+
+        amqp_queue_declare(
+            mConnection, 1,
+            amqp_cstring_bytes(HEALTH_COMMAND_QUEUE_NAME.c_str()), 0,
+            1, 0, 0, amqp_empty_table);
+        if (amqp_get_rpc_reply(mConnection).reply_type
+            != AMQP_RESPONSE_NORMAL)
+        {
+            qCritical() << "Error: Unable to declare RabbitMQ health command"
+                           " queue.";
+            cleanupConnection();
+            return false;
+        }
+
+        amqp_queue_bind(
+            mConnection, 1,
+            amqp_cstring_bytes(HEALTH_COMMAND_QUEUE_NAME.c_str()),
+            amqp_cstring_bytes(EXCHANGE_NAME.c_str()),
+            amqp_cstring_bytes(
+                HEALTH_RECEIVING_ROUTING_KEY.c_str()),
+            amqp_empty_table);
+        if (amqp_get_rpc_reply(mConnection).reply_type
+            != AMQP_RESPONSE_NORMAL)
+        {
+            qCritical() << "Error: Unable to bind RabbitMQ health command"
+                           " queue.";
+            cleanupConnection();
+            return false;
+        }
+
+        amqp_basic_consume(
+            mConnection, 1,
+            amqp_cstring_bytes(HEALTH_COMMAND_QUEUE_NAME.c_str()),
+            amqp_empty_bytes, 0, 0, 0, amqp_empty_table);
+        if (amqp_get_rpc_reply(mConnection).reply_type
+            != AMQP_RESPONSE_NORMAL)
+        {
+            qCritical() << "Error: Failed to start consuming from the RabbitMQ"
+                           " health queue.";
+            cleanupConnection();
+            return false;
+        }
+
+        return true;
+    }
+
+    void consumeLoop()
+    {
+        while (!mStopRequested.load() && !isInterruptionRequested())
+        {
+            if (!mConnection)
+                return;
+
+            amqp_rpc_reply_t res;
+            amqp_envelope_t  envelope;
+
+            amqp_maybe_release_buffers(mConnection);
+            struct timeval timeout;
+            timeout.tv_sec  = 0;
+            timeout.tv_usec = 100000;
+
+            res = amqp_consume_message(mConnection, &envelope,
+                                       &timeout, 0);
+            if (res.reply_type == AMQP_RESPONSE_NORMAL)
+            {
+                amqp_basic_ack(mConnection, 1,
+                               envelope.delivery_tag, 0);
+
+                const QByteArray messageData(
+                    static_cast<char *>(
+                        envelope.message.body.bytes),
+                    envelope.message.body.len);
+                const QJsonDocument doc =
+                    QJsonDocument::fromJson(messageData);
+                processHealthCommand(doc.object());
+                amqp_destroy_envelope(&envelope);
+            }
+            else if (res.reply_type
+                         == AMQP_RESPONSE_LIBRARY_EXCEPTION
+                     && res.library_error == AMQP_STATUS_TIMEOUT)
+            {
+                QThread::msleep(50);
+            }
+            else
+            {
+                qCritical()
+                    << "Error receiving message from RabbitMQ health lane."
+                    << "Type:" << res.reply_type;
+                return;
+            }
+        }
+    }
+
+    void processHealthCommand(const QJsonObject &jsonMessage)
+    {
+        if (!jsonMessage.contains("command"))
+        {
+            QJsonObject response;
+            response["event"]   = "connectionStatus";
+            response["host"]    = "ShipNetSim";
+            response["success"] = false;
+            response["status"]  = "invalid";
+            response["error"] =
+                "Missing 'command' field in the health message";
+            publish(HEALTH_PUBLISHING_ROUTING_KEY.c_str(), response);
+            return;
+        }
+
+        const QString command =
+            jsonMessage.value("command").toString();
+        const QString commandId =
+            jsonMessage.value("commandId").toString();
+        const QString replyRoutingKey =
+            resolveReplyRoutingKey(
+                jsonMessage,
+                QString::fromStdString(
+                    HEALTH_PUBLISHING_ROUTING_KEY));
+
+        QJsonObject response;
+        response["event"] = "connectionStatus";
+        response["host"]  = "ShipNetSim";
+        if (!commandId.isEmpty())
+            response["commandId"] = commandId;
+
+        if (command == "checkConnection")
+        {
+            qInfo() << "[Server] Received health command: checkConnection."
+                       " Responding with 'connected'.";
+            response["status"]  = "connected";
+            response["success"] = true;
+        }
+        else
+        {
+            response["status"]  = "unsupported";
+            response["success"] = false;
+            response["error"] =
+                "Unsupported health command: " + command;
+        }
+
+        publish(replyRoutingKey, response);
+    }
+
+    void publish(const QString &routingKey,
+                 const QJsonObject &message)
+    {
+        if (!mConnection)
+        {
+            qCritical() << "Cannot publish RabbitMQ health message;"
+                           " connection is null for routing key:"
+                        << routingKey;
+            return;
+        }
+
+        QByteArray messageData = QJsonDocument(message).toJson();
+        amqp_bytes_t messageBytes;
+        messageBytes.len   = messageData.size();
+        messageBytes.bytes = messageData.data();
+
+        amqp_basic_properties_t props;
+        props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG
+                       | AMQP_BASIC_DELIVERY_MODE_FLAG;
+        props.content_type =
+            amqp_cstring_bytes("application/json");
+        props.delivery_mode = 2;
+
+        const int publishStatus = amqp_basic_publish(
+            mConnection, 1,
+            amqp_cstring_bytes(EXCHANGE_NAME.c_str()),
+            amqp_cstring_bytes(routingKey.toStdString().c_str()), 0,
+            0, &props, messageBytes);
+        if (publishStatus != AMQP_STATUS_OK)
+        {
+            qCritical() << "Failed to publish RabbitMQ health message for"
+                        << routingKey;
+        }
+    }
+
+    void cleanupConnection()
+    {
+        if (!mConnection)
+            return;
+
+        amqp_channel_close(mConnection, 1, AMQP_REPLY_SUCCESS);
+        amqp_connection_close(mConnection, AMQP_REPLY_SUCCESS);
+        amqp_destroy_connection(mConnection);
+        mConnection = nullptr;
+    }
+
+    std::string                mHostname;
+    int                        mPort = 0;
+    QString                    mUsername;
+    QString                    mPassword;
+    std::atomic_bool           mStopRequested{false};
+    amqp_connection_state_t    mConnection = nullptr;
+};
 
 SimulationServer::SimulationServer(QObject *parent)
     : QObject(parent)
@@ -240,6 +577,15 @@ void SimulationServer::startRabbitMQServer(
     }
 
     reconnectToRabbitMQ();
+    if (mHealthControlPlane)
+    {
+        mHealthControlPlane->stopAndWait();
+        delete mHealthControlPlane;
+        mHealthControlPlane = nullptr;
+    }
+    mHealthControlPlane = new ShipNetSimHealthControlPlane(
+        mHostname, mPort, mUsername, mPassword, this);
+    mHealthControlPlane->start();
 }
 
 void SimulationServer::reconnectToRabbitMQ()
@@ -397,50 +743,6 @@ void SimulationServer::reconnectToRabbitMQ()
             continue; // Retry
         }
 
-        // Declare the response queue to send commands
-        amqp_queue_declare(
-            mRabbitMQConnection, 1,
-            amqp_cstring_bytes(RESPONSE_QUEUE_NAME.c_str()), 0, 1, 0,
-            0, amqp_empty_table);
-
-        if (amqp_get_rpc_reply(mRabbitMQConnection).reply_type
-            != AMQP_RESPONSE_NORMAL)
-        {
-            qCritical() << "Error: Unable to declare "
-                           "RabbitMQ response queue. "
-                           "Retrying...";
-            retryCount++;
-            std::this_thread::sleep_for(
-                std::chrono::seconds(RECONNECT_DELAY_SECONDS));
-            continue; // Retry
-        }
-
-        // Bind the response queue to the exchange with a
-        // routing key
-        amqp_queue_bind(
-            mRabbitMQConnection, 1,
-            amqp_cstring_bytes(
-                RESPONSE_QUEUE_NAME.c_str()), // Queue name
-            amqp_cstring_bytes(
-                EXCHANGE_NAME.c_str()), // Exchange name
-            amqp_cstring_bytes(
-                PUBLISHING_ROUTING_KEY.c_str()), // Routing key
-            amqp_empty_table                     // Arguments
-        );
-
-        amqp_rpc_reply_t resQueueRes =
-            amqp_get_rpc_reply(mRabbitMQConnection);
-        if (resQueueRes.reply_type != AMQP_RESPONSE_NORMAL)
-        {
-            qCritical() << "Error: Unable to bind queue to "
-                           "exchange.  "
-                           "Retrying...";
-            retryCount++;
-            std::this_thread::sleep_for(
-                std::chrono::seconds(RECONNECT_DELAY_SECONDS));
-            continue; // Retry
-        }
-
         // Listen for messages
         amqp_basic_consume(
             mRabbitMQConnection, 1,
@@ -477,11 +779,17 @@ void SimulationServer::reconnectToRabbitMQ()
 void SimulationServer::stopRabbitMQServer()
 {
     emit stopConsuming();
+    if (mHealthControlPlane)
+    {
+        mHealthControlPlane->stopAndWait();
+        delete mHealthControlPlane;
+        mHealthControlPlane = nullptr;
+    }
 
     // If the connection is already closed, just return
     if (mRabbitMQConnection == nullptr)
     {
-        qDebug() << "RabbitMQ connection already closed.";
+        qDebug() << "RabbitMQ main connection already closed.";
         return;
     }
 
@@ -505,9 +813,19 @@ void SimulationServer::startConsumingMessages()
 {
     if (mRabbitMQThread)
     {
-        mRabbitMQThread->quit();
-        mRabbitMQThread->wait();
-        mRabbitMQThread->deleteLater(); // Ensure proper deletion
+        if (QThread::currentThread() == mRabbitMQThread)
+        {
+            qWarning() << "startConsumingMessages called from the active "
+                          "consumer thread; quitting without self-wait.";
+            mRabbitMQThread->quit();
+            mRabbitMQThread->deleteLater();
+        }
+        else
+        {
+            mRabbitMQThread->quit();
+            mRabbitMQThread->wait();
+            mRabbitMQThread->deleteLater(); // Ensure proper deletion
+        }
     }
 
     // Move the consuming logic to a separate thread
@@ -601,7 +919,10 @@ void SimulationServer::consumeFromRabbitMQ()
                         << res.reply_type;
             stopRabbitMQServer();
             qDebug() << "Attempting to reconnect...";
-            reconnectToRabbitMQ();
+            QMetaObject::invokeMethod(
+                this,
+                [this]() { reconnectToRabbitMQ(); },
+                Qt::QueuedConnection);
             break;
         }
 
@@ -609,6 +930,7 @@ void SimulationServer::consumeFromRabbitMQ()
         QCoreApplication::processEvents();
     }
 }
+
 
 void SimulationServer::onDataReceivedFromRabbitMQ(
     QJsonObject &message, const amqp_envelope_t &envelope)
@@ -771,6 +1093,13 @@ void SimulationServer::processCommand(QJsonObject &jsonMessage)
     {
         commandID = jsonMessage["commandId"].toString();
     }
+    else
+    {
+        commandID.clear();
+    }
+    replyRoutingKey = resolveReplyRoutingKey(
+        jsonMessage,
+        QString::fromStdString(PUBLISHING_ROUTING_KEY));
 
     // Handle each command with improved error checking
     if (command == "checkConnection")
@@ -798,7 +1127,7 @@ void SimulationServer::processCommand(QJsonObject &jsonMessage)
         }
 
         // Send the response via RabbitMQ
-        sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(), response);
+        sendRabbitMQMessage(replyRoutingKey, response);
 
         // Signal that the worker is ready for the next
         // command
@@ -1043,6 +1372,24 @@ void SimulationServer::processCommand(QJsonObject &jsonMessage)
                  << nets;
 
         SimulatorAPI::InteractiveMode::finalizeSimulation(nets);
+
+        QJsonObject response;
+        response["event"]   = "simulationEnded";
+        response["host"]    = ShipNetSim_NAME;
+        response["success"] = true;
+        if (!commandID.isEmpty())
+        {
+            response["commandId"] = commandID;
+        }
+        QJsonArray jsonNets;
+        for (const QString &n : nets)
+        {
+            jsonNets.append(n);
+        }
+        response["networkNames"] = jsonNets;
+        sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(),
+                            response);
+        onWorkerReady();
     }
     else if (command == "addShipsToSimulator")
     {
@@ -1072,68 +1419,52 @@ void SimulationServer::processCommand(QJsonObject &jsonMessage)
         QString networkName =
             getJsonValue(jsonMessage, "networkName").toString();
 
-        // load the ships
-        QVector<std::shared_ptr<ShipNetSimCore::Ship>> shipsList;
+        QJsonObject shipPayload = jsonMessage;
+        if (!shipPayload.contains("ships")
+            && jsonMessage.contains("params")
+            && jsonMessage["params"].isObject())
+        {
+            shipPayload = jsonMessage["params"].toObject();
+        }
 
-        // Check if ships is in the root object or in params
-        if (jsonMessage.contains("ships"))
+        const QJsonValue shipsValue = shipPayload.value("ships");
+        if (!shipsValue.isArray())
         {
-            // Additional validation for ship objects
-            QJsonArray shipsArray = jsonMessage["ships"].toArray();
-            for (const QJsonValue &shipVal : shipsArray)
-            {
-                if (!shipVal.isObject())
-                {
-                    onErrorOccurred("'ships' array contains "
-                                    "invalid ship definitions");
-                    mWorkerBusy = false;
-                    return;
-                }
-            }
-            // Ships is in the root object, pass jsonMessage
-            shipsList =
-                SimulatorAPI::loadShips(jsonMessage, networkName);
+            onErrorOccurred("'ships' must be an array for command: "
+                            + command);
+            mWorkerBusy = false;
+            return;
         }
-        else if (jsonMessage.contains("params")
-                 && jsonMessage["params"].isObject())
+
+        const QJsonArray shipsArray = shipsValue.toArray();
+        if (shipsArray.isEmpty())
         {
-            // Ships is in params, pass the params object
-            // instead
-            QJsonObject params = jsonMessage["params"].toObject();
-            // Additional validation for ship objects
-            QJsonArray shipsArray = params["ships"].toArray();
-            for (const QJsonValue &shipVal : shipsArray)
-            {
-                if (!shipVal.isObject())
-                {
-                    onErrorOccurred("'ships' array contains "
-                                    "invalid ship definitions");
-                    mWorkerBusy = false;
-                    return;
-                }
-            }
-            if (params.contains("ships"))
-            {
-                shipsList =
-                    SimulatorAPI::loadShips(params, networkName);
-            }
-            else
-            {
-                // Neither contains ships
-                shipsList = QVector<std::shared_ptr<
-                    ShipNetSimCore::Ship>>(); // empty list
-            }
+            onErrorOccurred("No ships specified to add to simulator");
+            mWorkerBusy = false;
+            return;
         }
-        else
+
+        for (const QJsonValue &shipVal : shipsArray)
         {
-            // Neither contains ships
-            auto shipsList = QVector<
-                std::shared_ptr<ShipNetSimCore::Ship>>(); // empty
-                                                          // list
+            if (!shipVal.isObject())
+            {
+                onErrorOccurred("'ships' array contains invalid ship "
+                                "definitions");
+                mWorkerBusy = false;
+                return;
+            }
         }
 
         auto ships =
-            SimulatorAPI::loadShips(jsonMessage, networkName);
+            SimulatorAPI::loadShips(shipPayload, networkName);
+        if (ships.isEmpty())
+        {
+            onErrorOccurred("No valid ships were loaded for command: "
+                            + command);
+            mWorkerBusy = false;
+            return;
+        }
+
         SimulatorAPI::InteractiveMode::addShipToSimulation(
             networkName, ships);
     }
@@ -1286,11 +1617,47 @@ void SimulationServer::processCommand(QJsonObject &jsonMessage)
     }
     else if (command == "resetServer")
     {
+        qInfo().noquote()
+            << "\n==================== ShipNetSim reset requested ====================";
+        qInfo().noquote()
+            << "Reset received at:"
+            << QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+        qInfo().noquote()
+            << "====================================================================";
+
         qInfo() << "[Server] Received command: Resetting "
                    "the server.";
 
         SimulatorAPI::InteractiveMode::resetAPI();
         onServerReset();
+    }
+    else if (command == "notifyTerminalClosure")
+    {
+        QJsonObject response;
+        response["event"]   = "terminalClosureAcknowledged";
+        response["host"]    = ShipNetSim_NAME;
+        response["success"] = true;
+        if (!commandID.isEmpty())
+        {
+            response["commandId"] = commandID;
+        }
+        sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(),
+                            response);
+        onWorkerReady();
+    }
+    else if (command == "notifyTerminalReopened")
+    {
+        QJsonObject response;
+        response["event"]   = "terminalReopenedAcknowledged";
+        response["host"]    = ShipNetSim_NAME;
+        response["success"] = true;
+        if (!commandID.isEmpty())
+        {
+            response["commandId"] = commandID;
+        }
+        sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(),
+                            response);
+        onWorkerReady();
     }
     else
     {
@@ -1315,6 +1682,25 @@ void SimulationServer::onWorkerReady()
 void SimulationServer::sendRabbitMQMessage(const QString &routingKey,
                                            const QJsonObject &message)
 {
+    sendRabbitMQMessageOn(
+        mRabbitMQConnection,
+        resolveReplyRoutingKey(
+            message,
+            replyRoutingKey.isEmpty() ? routingKey : replyRoutingKey),
+        message);
+}
+
+void SimulationServer::sendRabbitMQMessageOn(
+    amqp_connection_state_t connection, const QString &routingKey,
+    const QJsonObject &message)
+{
+    if (!connection)
+    {
+        qCritical() << "Cannot publish RabbitMQ message; connection is null"
+                    << "for routing key:" << routingKey;
+        return;
+    }
+
     QByteArray messageData = QJsonDocument(message).toJson();
 
     amqp_bytes_t messageBytes;
@@ -1325,7 +1711,7 @@ void SimulationServer::sendRabbitMQMessage(const QString &routingKey,
     while (retries > 0)
     {
         int publishStatus = amqp_basic_publish(
-            mRabbitMQConnection, 1,
+            connection, 1,
             amqp_cstring_bytes(EXCHANGE_NAME.c_str()),
             amqp_cstring_bytes(routingKey.toUtf8().constData()), 0, 0,
             nullptr, messageBytes);
@@ -1535,8 +1921,9 @@ void SimulationServer::onAllShipsReachDestination(
     const QString networkName)
 {
     QJsonObject jsonMessage;
-    jsonMessage["event"] = "allShipsReachedDestination";
-    jsonMessage["host"]  = ShipNetSim_NAME;
+    jsonMessage["event"]       = "allShipsReachedDestination";
+    jsonMessage["networkName"] = networkName;
+    jsonMessage["host"]        = ShipNetSim_NAME;
     sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(), jsonMessage);
     onWorkerReady();
 }
@@ -1655,11 +2042,12 @@ void SimulationServer::onContainersUnloaded(QString    networkName,
 {
     std::cout << "containers unloaded\n";
     QJsonObject jsonMessage;
-    jsonMessage["event"]      = "containersUnloaded";
-    jsonMessage["host"]       = ShipNetSim_NAME;
-    jsonMessage["portName"]   = seaPortName;
-    jsonMessage["shipID"]     = shipID;
-    jsonMessage["containers"] = containers;
+    jsonMessage["event"]       = "containersUnloaded";
+    jsonMessage["host"]        = ShipNetSim_NAME;
+    jsonMessage["networkName"] = networkName;
+    jsonMessage["portName"]    = seaPortName;
+    jsonMessage["shipID"]      = shipID;
+    jsonMessage["containers"]  = containers;
 
     sendRabbitMQMessage(PUBLISHING_ROUTING_KEY.c_str(), jsonMessage);
     onWorkerReady();

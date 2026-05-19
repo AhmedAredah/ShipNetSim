@@ -638,7 +638,13 @@ void Simulator::runSimulation(units::time::second_t runFor,
     // Reset running flag (may have been set to false by previous termination)
     mIsSimulatorRunning = true;
 
-    while ((this->mSimulationTime <= this->mSimulationTime + runFor)
+    const units::time::second_t reportUntil =
+        std::isinf(runFor.value())
+            ? units::time::second_t(
+                  std::numeric_limits<double>::infinity())
+            : this->mSimulationTime + runFor;
+
+    while ((this->mSimulationTime <= reportUntil)
            && (this->mSimulationTime <= this->mSimulationEndTime))
     {
         {
@@ -670,9 +676,9 @@ void Simulator::runSimulation(units::time::second_t runFor,
 
             if (mIsExternallyControlled)
             {
-                qWarning() << "All ships have stopped moving.";
-
-                continue;
+                qWarning()
+                    << "All ships have stopped moving during an externally controlled chunk.";
+                break;
             }
             qWarning() << "All ships have stopped moving. Ending "
                           "simulation.";
@@ -688,12 +694,9 @@ void Simulator::runSimulation(units::time::second_t runFor,
 
             if (mIsExternallyControlled)
             {
-                // Pause the simulation to wait for new ships to be
-                // added
-                qDebug() << "All ships have reached their "
-                            "destination, pausing simulation.";
-                this->pauseSimulation(false);
-                continue;
+                qDebug()
+                    << "All ships have reached their destination during an externally controlled chunk.";
+                break;
             }
 
             qDebug() << "All ships have reached their destination.";

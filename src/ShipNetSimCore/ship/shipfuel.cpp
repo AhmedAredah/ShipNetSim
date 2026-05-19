@@ -110,9 +110,10 @@ ShipFuel::convertKwhToLiters(units::energy::kilowatt_hour_t energy,
                 calorificValueIt->second.calorificValue;
             // Convert energy in MJ to mass in kg
             auto mass = (energyInMJ / calorificValue).value();
-            // Convert mass in kg to volume in liter
+            // Convert mass in kg to volume in liter.
+            // density is kg/L, so volume = mass / density.
             auto volume_l =
-                units::volume::liter_t(mass * density.value());
+                units::volume::liter_t(mass / density.value());
             return volume_l;
         }
         else
@@ -151,8 +152,9 @@ ShipFuel::convertLitersToKwh(units::volume::liter_t volume,
         {
             auto calorificValue =
                 calorificValueIt->second.calorificValue;
-            // Convert volume in liters to mass in kg
-            auto mass_kg = (volume / density).value();
+            // Convert volume in liters to mass in kg.
+            // density is kg/L, so mass = volume * density.
+            auto mass_kg = (volume * density).value();
             // Convert mass in kg to energy in MJ
             auto energy_mj = units::energy::megajoule_t(
                 mass_kg * calorificValue.value());

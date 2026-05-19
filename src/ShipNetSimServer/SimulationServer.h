@@ -23,6 +23,8 @@ struct timeval
 using ShipParamsMap = QMap<QString, QString>;
 Q_DECLARE_METATYPE(ShipParamsMap)
 
+class ShipNetSimHealthControlPlane;
+
 class SimulationServer : public QObject
 {
     Q_OBJECT
@@ -96,8 +98,10 @@ private:
     QWaitCondition mWaitCondition;
     amqp_connection_state_t mRabbitMQConnection;
     QMetaObject::Connection m_progressConnection;
+    ShipNetSimHealthControlPlane *mHealthControlPlane = nullptr;
 
     QString commandID;
+    QString replyRoutingKey;
 
     void loadRabbitMQConfig();
 
@@ -107,6 +111,9 @@ private:
     void startConsumingMessages();
     void reconnectToRabbitMQ();
     void setupServer();
+    void sendRabbitMQMessageOn(amqp_connection_state_t connection,
+                               const QString     &routingKey,
+                               const QJsonObject &message);
 
     QPair<bool, QString>
     checkJsonField(const QJsonObject &json, const QString &fieldName,
