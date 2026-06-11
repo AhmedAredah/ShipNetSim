@@ -17,7 +17,7 @@
   <a href="https://github.com/VTTI-CSM/ShipNetSim/releases">
     <img alt="GitHub tag (latest by date)" src="https://img.shields.io/github/v/tag/VTTI-CSM/ShipNetSim.svg?label=latest">
   </a>
-  <img alt="GitHub All Releases" src="https://img.shields.io/github/downloads/VTTI-CSM/ShipNetSim/total.svg">
+  <img alt="GitHub All Releases" src="https://img.shields.io/github/downloads/VTTI-CSM/ShipNetSim/total.svg?cacheSeconds=3600">
   <a href="">
     <img src="https://img.shields.io/badge/CLA-CLA%20Required-red" alt="CLA Required">
     <a href="https://cla-assistant.io/VTTI-CSM/ShipNetSim"><img src="https://cla-assistant.io/readme/badge/VTTI-CSM/ShipNetSim" alt="CLA assistant" /></a>
